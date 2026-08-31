@@ -196,3 +196,12 @@ commands rather than changing Core API V1:
 Core/integration work should treat `account_id` from the registry as stable and
 must never fall back to global `pkill` or display-global UI input without the
 DISPLAY lock.
+
+## Post-login window restore fix
+
+During live testing, minimized WeChat surfaces remained `Iconic` and hidden on
+the shared DISPLAY. `xdotool windowmap` was insufficient because the window was
+already mapped at the X11 resource level. The runtime now selects the account's
+`Weixin` surface and issues an EWMH `windowactivate` through the per-account
+DISPLAY lock. Calling `start` while the process is already running performs this
+restore and reports `action: restored`.

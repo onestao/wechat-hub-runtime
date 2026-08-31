@@ -669,13 +669,46 @@ def _spawn_auto_login(account: Dict[str, Any], paths: RuntimePaths) -> None:
     )
 
 
+def _show_account_window(account: Dict[str, Any]) -> bool:
+    """Restore an existing WeChat surface without touching other accounts."""
+
+    windows = account_windows(account)["windows"]
+    if not windows:
+        return False
+    selected = next(
+        (item for item in windows if item.get("title") == "Weixin"),
+        windows[0],
+    )
+    try:
+        subprocess.run(
+            [
+                "/scripts/wechat/wechat-display-lock.sh",
+                account["id"],
+                "xdotool",
+                "windowactivate",
+                "--sync",
+                str(selected["window_id"]),
+            ],
+            check=True,
+            env=account_environment(account),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
 def start_account(account: Dict[str, Any], paths: RuntimePaths) -> Dict[str, Any]:
     require_root("start")
     bootstrap_account(account, paths)
     existing = account_processes(account)
     if existing:
         result = status_for(account)
-        result["action"] = "already-running"
+        if _show_account_window(account):
+            result["action"] = "restored"
+        else:
+            result["action"] = "already-running"
         return result
 
     wechat_bin = os.environ.get("WECHAT_BINARY", "/usr/bin/wechat")
@@ -868,11 +901,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 0
             if args.command == "window":
                 windows = account_windows(account)["windows"]
-                if not windows:
+                selected = next(
+                    (item for item in windows if item.get("title") == "Weixin"),
+                    windows[0] if windows else None,
+                )
+                if selected is None:
                     raise RuntimeErrorWithHint(
                         f"no WeChat window discovered for account {args.account}"
                     )
-                print(windows[0]["window_id"])
+                print(selected["window_id"])
                 return 0
             if args.command == "start":
                 result = start_account(account, registry.paths)
@@ -921,4 +958,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

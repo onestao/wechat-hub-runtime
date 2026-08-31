@@ -71,6 +71,11 @@ Inside the container:
 /scripts/wechat/wechat-runtime unregister work --json
 ```
 
+If a WeChat client was minimized, `start <account_id>` is also the restore
+command. It activates that account's `Weixin` window through the shared-DISPLAY
+lock instead of launching a duplicate process; `start --json` then reports
+`action: restored`.
+
 `unregister` intentionally preserves both the Unix user and its data directory.
 That prevents an operator typo from deleting a logged-in profile.
 
@@ -137,4 +142,3 @@ Run the same-display process proof inside a real built Linux container:
 The script proves two official WeChat process sets use different UIDs/HOMEs and
 the same DISPLAY. The final Gate-0 proof still requires opening Selkies, logging
 both real clients in, and recording the status/window evidence.
-
