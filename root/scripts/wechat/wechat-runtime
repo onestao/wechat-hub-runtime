@@ -22,4 +22,3 @@ fi
 # required by the account processes. Hardened images with sudo disabled must
 # invoke this manager from a root-side supervisor/API instead.
 exec sudo -n -E "$PYTHON_BIN" "$MANAGER" "$@"
-

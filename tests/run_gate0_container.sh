@@ -92,4 +92,3 @@ echo "Gate-0 container is intentionally left running for real WeChat login proof
 echo "HTTP : http://${HOST_IP:-HOST}:$HTTP_PORT"
 echo "HTTPS: https://${HOST_IP:-HOST}:$HTTPS_PORT"
 echo "Cleanup is explicit and guarded: tests/cleanup_gate0_container.sh"
-

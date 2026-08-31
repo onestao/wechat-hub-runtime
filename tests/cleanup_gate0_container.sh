@@ -31,4 +31,3 @@ docker compose \
 
 echo "Removed only the isolated Gate-0 Compose container/network."
 echo "Images and files were intentionally preserved."
-

@@ -61,4 +61,3 @@ echo
 echo "Process-level topology A proof passed. Complete the real Gate-0 proof by"
 echo "opening the Selkies UI, logging both official WeChat clients in, and"
 echo "capturing the resulting status JSON/window IDs in docs/GATE0_POC_RESULT.md."
-

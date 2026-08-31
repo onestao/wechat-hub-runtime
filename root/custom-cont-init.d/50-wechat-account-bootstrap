@@ -6,4 +6,3 @@ set -euo pipefail
 # half-created before /scripts/start.sh attempts to launch WeChat.
 mkdir -p /config/wechat-runtime
 /scripts/wechat/wechat-runtime bootstrap --json >/config/wechat-runtime/bootstrap-last.json
-

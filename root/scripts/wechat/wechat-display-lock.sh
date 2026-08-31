@@ -18,4 +18,3 @@ mkdir -p "$LOCK_DIR"
 # Clipboard, focus and xdotool-style input are display-global even when each
 # WeChat process has a separate Unix user/HOME/XDG tree.
 exec flock "$LOCK_DIR/display-${SAFE_DISPLAY}.lock" "$@"
-

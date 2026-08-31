@@ -6,4 +6,3 @@ services:
     restart: "no"
     labels:
       com.wechat-hub.gate0: "session-a"
-
