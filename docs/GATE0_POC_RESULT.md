@@ -1,6 +1,6 @@
 # Gate 0 POC Result
 
-Status: **PASSED AT PROCESS LEVEL ON UNRAID**
+Status: **PASSED AT PROCESS LEVEL ON UNRAID; MANUAL LOGIN PROOF REMAINS**
 
 Date: 2026-08-31 19:29 +08:00
 Host: Unraid (`x86_64`, Docker `27.5.1`, Compose `v2.40.3`)
