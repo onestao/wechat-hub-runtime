@@ -4,8 +4,7 @@ Date: 2026-08-31 (Asia/Shanghai)
 
 Branch: `feat/multi-account-runtime`
 
-Gate result: **Gate 0 process-level PASS on Unraid; manual login/window
-confirmation remains.**
+Gate result: **Gate 0 PASS on Unraid.**
 
 ## Upstream used
 
@@ -140,18 +139,28 @@ both accounts: display=:1
 health: healthy=true
 ```
 
-Window discovery found one distinct `Weixin` window per account:
+Window discovery found one distinct `Weixin` window per account before login:
 
 ```text
 gate0-a: window_id=0xC00006
 gate0-b: window_id=0xE00006
 ```
 
-Full evidence and the official package hash are recorded in
-`docs/GATE0_POC_RESULT.md`. The container is intentionally still running at
-ports `13000/13001` for the human login proof.
+The operator then logged both official clients in through the Selkies UI. The
+post-login `health --json` read still reported `healthy: true`, with separate
+UID/HOME trees and live windows:
 
-## Gate-0 handoff
+```text
+gate0-a: uid=20000, window_id=0xC00037, windows=1
+gate0-b: uid=20001, window_id=0xE00037/0xE0003D, windows=2
+both accounts: display=:1
+```
+
+Full evidence and the official package hash are recorded in
+`docs/GATE0_POC_RESULT.md`. The isolated container remains running at ports
+`13000/13001`.
+
+## Gate-0 reproduction
 
 On a Linux Docker host:
 
@@ -162,9 +171,10 @@ docker exec -it wechat-selkies /scripts/wechat/poc_same_display.sh gate0-a gate0
 docker exec -it wechat-selkies /scripts/wechat/wechat-runtime health --json
 ```
 
-Then open the existing Selkies Web UI, log both real official WeChat clients in,
-and record the two distinct UIDs/HOMEs plus shared DISPLAY, PIDs and window IDs
-in `docs/GATE0_POC_RESULT.md`.
+Then open the Selkies Web UI, log both real official WeChat clients in, and
+record the two distinct UIDs/HOMEs plus shared DISPLAY, PIDs and window IDs in
+`docs/GATE0_POC_RESULT.md`. This step has now been completed for the current
+Unraid proof.
 
 Do not test separate displays unless this real same-DISPLAY topology fails for a
 documented technical reason.

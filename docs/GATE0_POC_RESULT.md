@@ -1,8 +1,9 @@
 # Gate 0 POC Result
 
-Status: **PASSED AT PROCESS LEVEL ON UNRAID; MANUAL LOGIN PROOF REMAINS**
+Status: **PASSED ON UNRAID**
 
-Date: 2026-08-31 19:29 +08:00
+Date: 2026-08-31 19:29 +08:00 (process proof)
+Login confirmation: 2026-08-31 19:53 +08:00
 Host: Unraid (`x86_64`, Docker `27.5.1`, Compose `v2.40.3`)
 Project: `wechat-hub-a-gate0`
 Container: `wechat-hub-a-gate0-runtime`
@@ -73,7 +74,25 @@ for this test.
 QQ was also installed because it is enabled by the upstream default build.
 Its download and dependency repair succeeded. QQ is outside the Gate-0 proof.
 
-## Remaining Human Check
+## Logged-In Confirmation
+
+The operator logged both WeChat clients in through the Selkies UI. The
+follow-up `health --json` read at 19:53 +08:00 still reported `healthy: true`
+and kept the two account trees isolated:
+
+```text
+gate0-a: uid=20000, window_id=0xC00037, windows=1
+gate0-b: uid=20001, window_id=0xE00037/0xE0003D, windows=2
+both accounts: display=:1
+```
+
+The additional gate0-b window is an extra visible WeChat surface; both window
+IDs still resolved through PID `528` and UID `20001`. This satisfies the manual
+login/window portion of Gate 0.
+
+## Login Check Result
+
+Both automated process isolation and the human login/window check are complete.
 
 The automated result proves process isolation, separate profiles and separate
 X11 windows. The remaining Gate-0 login proof is to open the Selkies UI above,
