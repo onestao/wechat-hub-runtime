@@ -1,0 +1,6 @@
+*.sh text eol=lf
+*.py text eol=lf
+root/defaults/autostart text eol=lf
+root/custom-cont-init.d/* text eol=lf
+root/scripts/wechat/wechat-runtime text eol=lf
+

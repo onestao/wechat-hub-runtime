@@ -43,8 +43,8 @@ while true; do
     echo "💤 Sleeping $SLEEP_TO_STOP seconds until next stop time ($STOP_TIME)..."
     sleep "$SLEEP_TO_STOP"
     
-    echo "🛑 Nightly scheduled stop: stopping WeChat..."
-    /scripts/wechat/wechat-stop.sh
+    echo "🛑 Nightly scheduled stop: stopping registered WeChat accounts..."
+    /scripts/wechat/wechat-runtime stop-all --autostart-only || true
     
     NOW_TS=$(date +%s)
     START_TS=$(get_next_timestamp "$START_TIME")
@@ -58,11 +58,8 @@ while true; do
     echo "💤 Sleeping $SLEEP_TO_START seconds until next start time ($START_TIME)..."
     sleep "$SLEEP_TO_START"
     
-    echo "🚀 Nightly scheduled restart: starting WeChat..."
+    echo "🚀 Nightly scheduled restart: starting registered WeChat accounts..."
     if [ -f /usr/bin/wechat ]; then
-        nohup /usr/bin/wechat > /dev/null 2>&1 &
-        if [ "${ENABLE_WECHAT_AUTO_LOGIN:-true}" = "true" ]; then
-            nohup /lsiopy/bin/python3 /scripts/wechat/wechat-auto-login.py >/dev/null 2>&1 &
-        fi
+        /scripts/wechat/wechat-runtime start-all --autostart-only || true
     fi
 done

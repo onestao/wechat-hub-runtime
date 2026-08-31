@@ -1,0 +1,25 @@
+#!/bin/bash
+set -euo pipefail
+
+PYTHON_BIN="/lsiopy/bin/python3"
+if [ ! -x "$PYTHON_BIN" ]; then
+    PYTHON_BIN="$(command -v python3)"
+fi
+
+MANAGER="/scripts/wechat/wechat_runtime.py"
+
+if [ "$(id -u)" -eq 0 ]; then
+    exec "$PYTHON_BIN" "$MANAGER" "$@"
+fi
+
+if ! command -v sudo >/dev/null 2>&1; then
+    echo "wechat-runtime: root is required and sudo is unavailable" >&2
+    exit 2
+fi
+
+# LinuxServer Selkies normally grants the abc desktop user passwordless sudo.
+# Preserve the desktop environment because DISPLAY/DBUS/PULSE variables are
+# required by the account processes. Hardened images with sudo disabled must
+# invoke this manager from a root-side supervisor/API instead.
+exec sudo -n -E "$PYTHON_BIN" "$MANAGER" "$@"
+

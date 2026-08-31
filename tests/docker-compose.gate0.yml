@@ -1,0 +1,9 @@
+services:
+  wechat-selkies:
+    # Never reuse the upstream/default container name during a Gate-0 test on
+    # a shared Docker host such as Unraid.
+    container_name: wechat-hub-a-gate0-runtime
+    restart: "no"
+    labels:
+      com.wechat-hub.gate0: "session-a"
+

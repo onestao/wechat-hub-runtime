@@ -40,12 +40,24 @@ fi
 
 nohup stalonetray --dockapp-mode simple > /dev/null 2>&1 &
 
-# start WeChat application in the background if exists and auto-start enabled
+# Start WeChat through the account registry. With no WECHAT_ACCOUNTS setting,
+# the registry creates one legacy `default` account backed by the existing abc
+# user and /config HOME, preserving the original single-account data path.
 if [ "$AUTO_START_WECHAT" = "true" ]; then
     if [ -f /usr/bin/wechat ]; then
-        nohup /usr/bin/wechat > /dev/null 2>&1 &
-        if [ "${ENABLE_WECHAT_AUTO_LOGIN:-true}" = "true" ]; then
-            nohup /lsiopy/bin/python3 /scripts/wechat/wechat-auto-login.py >/dev/null 2>&1 &
+        if /scripts/wechat/wechat-runtime bootstrap >/dev/null 2>&1; then
+            /scripts/wechat/wechat-runtime start-all --autostart-only || true
+        elif [ -z "${WECHAT_ACCOUNTS:-}" ]; then
+            # Compatibility fallback for hardened Selkies configurations where
+            # sudo is intentionally disabled. Explicit multi-account configs
+            # must never silently degrade to one global process.
+            echo "WARN: account bootstrap unavailable; using legacy single-account launch" >&2
+            nohup /usr/bin/wechat > /dev/null 2>&1 &
+            if [ "${ENABLE_WECHAT_AUTO_LOGIN:-true}" = "true" ]; then
+                nohup /lsiopy/bin/python3 /scripts/wechat/wechat-auto-login.py --account default >/dev/null 2>&1 &
+            fi
+        else
+            echo "ERROR: multi-account WeChat bootstrap failed" >&2
         fi
     fi
 fi

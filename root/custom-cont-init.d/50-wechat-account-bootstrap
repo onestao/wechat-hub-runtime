@@ -1,0 +1,9 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+
+# LinuxServer custom-cont-init scripts run as root. The desktop startup path
+# also calls bootstrap, so a base-image ordering/race cannot leave accounts
+# half-created before /scripts/start.sh attempts to launch WeChat.
+mkdir -p /config/wechat-runtime
+/scripts/wechat/wechat-runtime bootstrap --json >/config/wechat-runtime/bootstrap-last.json
+

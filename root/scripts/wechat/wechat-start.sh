@@ -1,3 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
-/usr/bin/wechat
+ACCOUNT_ID="${1:-${WECHAT_DEFAULT_ACCOUNT_ID:-default}}"
+exec /scripts/wechat/wechat-runtime start "$ACCOUNT_ID"

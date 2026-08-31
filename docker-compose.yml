@@ -18,9 +18,20 @@ services:
       - PGID=${PGID:-100}               # set group id according to your system
       - CUSTOM_USER=${CUSTOM_USER:-}    # recommended to set a custom user name
       - PASSWORD=${PASSWORD:-}          # recommended to set a password for selkies web ui
+      - AUTO_START_WECHAT=${AUTO_START_WECHAT:-true}
       - ENABLE_WECHAT_NIGHTLY_RESTART=${ENABLE_WECHAT_NIGHTLY_RESTART:-false}
       - WECHAT_NIGHTLY_STOP_TIME=${WECHAT_NIGHTLY_STOP_TIME:-23:30}
       - WECHAT_NIGHTLY_START_TIME=${WECHAT_NIGHTLY_START_TIME:-01:30}
       - ENABLE_WECHAT_AUTO_LOGIN=${ENABLE_WECHAT_AUTO_LOGIN:-true}
       - AUTO_LOGIN_DELAY=${AUTO_LOGIN_DELAY:-3}
+      # Comma-separated account ids. Empty keeps the upstream-compatible
+      # default account on abc + /config. Example: default,work
+      - WECHAT_ACCOUNTS=${WECHAT_ACCOUNTS:-}
+      - WECHAT_DEFAULT_ACCOUNT_ID=${WECHAT_DEFAULT_ACCOUNT_ID:-default}
+      - WECHAT_ACCOUNT_UID_BASE=${WECHAT_ACCOUNT_UID_BASE:-20000}
+      - WECHAT_ACCOUNTS_FILE=${WECHAT_ACCOUNTS_FILE:-/config/wechat-runtime/accounts.json}
+      - WECHAT_ACCOUNT_HOME_ROOT=${WECHAT_ACCOUNT_HOME_ROOT:-/config/wechat-accounts}
+      # Optional per-account X display overrides: work=:1,test=:1
+      - WECHAT_ACCOUNT_DISPLAY_MAP=${WECHAT_ACCOUNT_DISPLAY_MAP:-}
+      - WECHAT_LEGACY_DEFAULT_ACCOUNT=${WECHAT_LEGACY_DEFAULT_ACCOUNT:-true}
     shm_size: "${SHM_SIZE:-1gb}"        # recommended, will improve performance

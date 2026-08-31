@@ -28,7 +28,7 @@ RUN apt-get update && \
     libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libpangocairo-1.0-0 libstdc++6 libx11-6 \
     libxcomposite1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 \
     libxss1 libxtst6 libatomic1 libxcomposite1 libxrender1 libxrandr2 libxkbcommon-x11-0 \
-    libfontconfig1 libdbus-1-3 libnss3 libx11-xcb1 stalonetray inotify-tools
+    libfontconfig1 libdbus-1-3 libnss3 libx11-xcb1 stalonetray inotify-tools util-linux xdotool
 
 ARG INSTALL_PCMANFM
 RUN if [ "$INSTALL_PCMANFM" = "true" ]; then \
@@ -107,6 +107,14 @@ ENV WECHAT_NIGHTLY_STOP_TIME="23:30"
 ENV WECHAT_NIGHTLY_START_TIME="01:30"
 ENV ENABLE_WECHAT_AUTO_LOGIN="true"
 ENV AUTO_LOGIN_DELAY="3"
+ENV WECHAT_ACCOUNTS=""
+ENV WECHAT_DEFAULT_ACCOUNT_ID="default"
+ENV WECHAT_ACCOUNTS_FILE="/config/wechat-runtime/accounts.json"
+ENV WECHAT_ACCOUNT_HOME_ROOT="/config/wechat-accounts"
+ENV WECHAT_RUNTIME_DIR="/run/wechat-runtime"
+ENV WECHAT_ACCOUNT_UID_BASE="20000"
+ENV WECHAT_ACCOUNT_DISPLAY_MAP=""
+ENV WECHAT_LEGACY_DEFAULT_ACCOUNT="true"
 
 
 
@@ -115,3 +123,22 @@ RUN cp /usr/share/icons/hicolor/128x128/apps/wechat.png /usr/share/selkies/www/i
 
 # add local files
 COPY /root /
+COPY /tests/poc_same_display.sh /scripts/wechat/poc_same_display.sh
+
+# The project is frequently checked out on Windows. Normalize only this
+# repository's copied text files so CRLF autocrlf settings cannot break Linux
+# shebangs/Bash parsing without touching unrelated Selkies base-image scripts.
+RUN find /scripts/wechat /scripts/qq -type f -exec sed -i 's/\r$//' {} + && \
+    sed -i 's/\r$//' \
+        /scripts/start.sh \
+        /scripts/refresh-menu.sh \
+        /scripts/window_switcher.py \
+        /custom-cont-init.d/50-wechat-account-bootstrap
+
+# apply_patch-created files do not carry executable bits in every checkout.
+RUN chmod +x /custom-cont-init.d/50-wechat-account-bootstrap \
+    /scripts/wechat/wechat-runtime \
+    /scripts/wechat/wechat_runtime.py \
+    /scripts/wechat/wechat-display-lock.sh \
+    /scripts/wechat/poc_same_display.sh \
+    /scripts/wechat/*.sh
