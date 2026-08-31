@@ -95,7 +95,6 @@ login/window portion of Gate 0.
 Both automated process isolation and the human login/window check are complete.
 
 The automated result proves process isolation, separate profiles and separate
-X11 windows. The remaining Gate-0 login proof is to open the Selkies UI above,
-log both official clients into different WeChat accounts, and record that the
-two distinct windows remain active after login. This is a browser and mobile
-WeChat action and cannot be safely automated by this package.
+X11 windows. The operator then completed the required Selkies/mobile login step
+and the 19:53 +08:00 follow-up status confirmed that both distinct account
+windows remained active. **Gate 0 is complete; no login proof remains pending.**
