@@ -6,9 +6,14 @@ LABEL org.opencontainers.image.title="WeChat Selkies"
 LABEL org.opencontainers.image.description="WeChat Linux client in browser via Selkies WebRTC"
 LABEL org.opencontainers.image.authors="nickrunning"
 LABEL org.opencontainers.image.source="https://github.com/nickrunning/wechat-selkies"
+LABEL org.opencontainers.image.revision="${OCI_REVISION}"
+LABEL org.opencontainers.image.version="${OCI_VERSION}"
 LABEL org.opencontainers.image.documentation="https://github.com/nickrunning/wechat-selkies#readme"
 LABEL org.opencontainers.image.vendor="WeChat Selkies Project"
 LABEL org.opencontainers.image.licenses="GPL-3.0-only"
+
+ARG OCI_REVISION
+ARG OCI_VERSION
 
 # Build arguments for multi-arch support
 ARG TARGETPLATFORM
