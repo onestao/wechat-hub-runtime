@@ -35,7 +35,7 @@ RUN if [ "$INSTALL_PCMANFM" = "true" ]; then \
         apt-get install -y --no-install-recommends pcmanfm; \
     fi
 
-RUN pip install --no-cache-dir python-xlib
+RUN pip install --no-cache-dir python-xlib Pillow==11.3.0 websocket-client==1.8.0 aiohttp==3.12.15
 
 # Install WeChat based on target architecture
 RUN case "$TARGETPLATFORM" in \
@@ -112,9 +112,23 @@ ENV WECHAT_DEFAULT_ACCOUNT_ID="default"
 ENV WECHAT_ACCOUNTS_FILE="/config/wechat-runtime/accounts.json"
 ENV WECHAT_ACCOUNT_HOME_ROOT="/config/wechat-accounts"
 ENV WECHAT_RUNTIME_DIR="/run/wechat-runtime"
+ENV WECHAT_RUNTIME_CONTROL_SOCKET="/run/wechat-runtime/control.sock"
 ENV WECHAT_ACCOUNT_UID_BASE="20000"
 ENV WECHAT_ACCOUNT_DISPLAY_MAP=""
 ENV WECHAT_LEGACY_DEFAULT_ACCOUNT="true"
+ENV AGENT_WECHAT_IMAGE="ghcr.io/thisnick/agent-wechat:0.11.15"
+ENV AGENT_WECHAT_SHM_MB="512"
+ENV AGENT_WECHAT_PULL_TIMEOUT="900"
+ENV WECHAT_DESKTOP_GATEWAY_BIND="0.0.0.0"
+ENV WECHAT_DESKTOP_GATEWAY_PORT="17892"
+ENV WECHAT_DESKTOP_GATEWAY_SESSION_TTL="14400"
+ENV WECHAT_DESKTOP_GATEWAY_MAX_WS_FRAME_MB="64"
+ENV WECHAT_DESKTOP_GATEWAY_MAX_HTTP_MB="1024"
+ENV WECHAT_DESKTOP_GATEWAY_PUBLIC_SCHEME="http"
+ENV WECHAT_DESKTOP_GATEWAY_PUBLIC_HOST=""
+ENV WECHAT_DESKTOP_GATEWAY_PUBLIC_PORT=""
+ENV WECHAT_SELKIES_ATTACH_ENABLED="true"
+ENV WECHAT_SELKIES_ATTACH_IMAGE=""
 
 
 
@@ -133,12 +147,20 @@ RUN find /scripts/wechat /scripts/qq -type f -exec sed -i 's/\r$//' {} + && \
         /scripts/start.sh \
         /scripts/refresh-menu.sh \
         /scripts/window_switcher.py \
-        /custom-cont-init.d/50-wechat-account-bootstrap
+        /custom-cont-init.d/50-wechat-account-bootstrap \
+        /custom-services.d/wechat-runtime-control \
+        /custom-services.d/wechat-desktop-gateway
 
 # apply_patch-created files do not carry executable bits in every checkout.
 RUN chmod +x /custom-cont-init.d/50-wechat-account-bootstrap \
+    /custom-services.d/wechat-runtime-control \
+    /custom-services.d/wechat-desktop-gateway \
     /scripts/wechat/wechat-runtime \
     /scripts/wechat/wechat_runtime.py \
+    /scripts/wechat/wechat_runtime_control.py \
+    /scripts/wechat/agent_wechat_runtime.py \
+    /scripts/wechat/desktop_gateway.py \
+    /scripts/wechat/wechat-window-capture.py \
     /scripts/wechat/wechat-display-lock.sh \
     /scripts/wechat/poc_same_display.sh \
     /scripts/wechat/*.sh

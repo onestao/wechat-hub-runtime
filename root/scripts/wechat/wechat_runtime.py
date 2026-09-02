@@ -44,6 +44,7 @@ DEFAULT_ACCOUNT_ID = "default"
 DEFAULT_UID_BASE = 20000
 DEFAULT_DISPLAY = ":1"
 DEVICE_GROUP_ALLOWLIST = {"audio", "input", "plugdev", "render", "video"}
+RUNTIME_PROVIDERS = {"legacy", "agent_wechat"}
 
 
 class RuntimeErrorWithHint(RuntimeError):
@@ -100,6 +101,25 @@ def account_username(account_id: str) -> str:
         return base
     digest = hashlib.sha1(account_id.encode("utf-8")).hexdigest()[:6]
     return f"{base[:21]}_{digest}"
+
+
+def sanitize_account_runtime_name(account_id: str) -> str:
+    """Return a Docker-safe, collision-resistant account resource suffix."""
+
+    validate_account_id(account_id)
+    normalized = re.sub(r"[^a-z0-9]+", "-", account_id.lower()).strip("-")
+    normalized = (normalized or "account")[:32].rstrip("-") or "account"
+    digest = hashlib.sha256(account_id.encode("utf-8")).hexdigest()[:8]
+    return f"{normalized}-{digest}"
+
+
+def runtime_provider(account: Dict[str, Any]) -> str:
+    provider = str(account.get("runtime_provider") or "legacy").strip().lower()
+    if provider not in RUNTIME_PROVIDERS:
+        raise RuntimeErrorWithHint(
+            f"unsupported runtime_provider {provider!r}; expected one of {sorted(RUNTIME_PROVIDERS)}"
+        )
+    return provider
 
 
 def display_lock_name(display_name: str) -> str:
@@ -210,6 +230,7 @@ class Registry:
             accounts.append(
                 {
                     "id": account_id,
+                    "display_name": account_id,
                     "username": username,
                     "uid": uid,
                     "display": display_map.get(account_id, default_display),
@@ -217,6 +238,7 @@ class Registry:
                     "enabled": True,
                     "autostart": True,
                     "legacy": use_legacy_abc,
+                    "runtime_provider": "legacy",
                 }
             )
 
@@ -241,6 +263,7 @@ class Registry:
             if not isinstance(account, dict):
                 raise RuntimeErrorWithHint("registry account entry must be an object")
             account_id = validate_account_id(str(account.get("id", "")))
+            runtime_provider(account)
             username = str(account.get("username", ""))
             if not username:
                 raise RuntimeErrorWithHint(f"missing username for {account_id}")
@@ -335,6 +358,13 @@ def bootstrap_account(account: Dict[str, Any], paths: RuntimePaths) -> bool:
     """Create/reconcile one Unix account. Returns True if registry changed."""
 
     require_root("bootstrap")
+    if runtime_provider(account) == "agent_wechat":
+        from agent_wechat_runtime import AgentWechatManager
+
+        # agent-wechat owns its own Unix user/Xvfb/AT-SPI environment inside
+        # the child container. Runtime only prepares persistent account data.
+        AgentWechatManager().prepare_files(account)
+        return False
     changed = False
     username = account["username"]
 
@@ -427,6 +457,11 @@ def bootstrap_account(account: Dict[str, Any], paths: RuntimePaths) -> bool:
 def bootstrap_all(registry: Registry) -> Dict[str, Any]:
     require_root("bootstrap")
     with registry.locked():
+        # The runtime directory may be shared with Core and may survive a
+        # container restart.  A stale readiness marker must never outlive the
+        # bootstrap that produced it.
+        ready = registry.paths.runtime_dir / "bootstrap.ready"
+        ready.unlink(missing_ok=True)
         data = registry.load(create=True)
         registry.paths.runtime_dir.mkdir(parents=True, exist_ok=True)
         locks = registry.paths.runtime_dir / "locks"
@@ -439,7 +474,6 @@ def bootstrap_all(registry: Registry) -> Dict[str, Any]:
         if changed:
             registry.save(data)
 
-        ready = registry.paths.runtime_dir / "bootstrap.ready"
         ready.write_text(str(int(time.time())) + "\n", encoding="utf-8")
         os.chmod(ready, 0o644)
         return data
@@ -590,11 +624,14 @@ def account_windows(account: Dict[str, Any]) -> Dict[str, Any]:
                     # account-safe correlation; for legacy abc stay strict.
                     if account.get("legacy"):
                         continue
+                geometry = win.get_geometry()
                 windows.append(
                     {
                         "window_id": int(wid),
                         "pid": pid,
                         "title": _window_title(win, d),
+                        "width": int(getattr(geometry, "width", 0) or 0),
+                        "height": int(getattr(geometry, "height", 0) or 0),
                     }
                 )
             except Exception:
@@ -606,10 +643,16 @@ def account_windows(account: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def status_for(account: Dict[str, Any]) -> Dict[str, Any]:
+    if runtime_provider(account) == "agent_wechat":
+        from agent_wechat_runtime import AgentWechatManager
+
+        return AgentWechatManager().status(account)
     pids = account_processes(account)
     windows = account_windows(account)
     return {
         "account_id": account["id"],
+        "display_name": str(account.get("display_name") or account["id"]),
+        "runtime_provider": "legacy",
         "enabled": bool(account.get("enabled", True)),
         "autostart": bool(account.get("autostart", True)),
         "legacy": bool(account.get("legacy", False)),
@@ -701,6 +744,11 @@ def _show_account_window(account: Dict[str, Any]) -> bool:
 
 def start_account(account: Dict[str, Any], paths: RuntimePaths) -> Dict[str, Any]:
     require_root("start")
+    if runtime_provider(account) == "agent_wechat":
+        from agent_wechat_runtime import AgentWechatManager
+
+        AgentWechatManager().prepare_files(account)
+        return AgentWechatManager().start(account)
     bootstrap_account(account, paths)
     existing = account_processes(account)
     if existing:
@@ -744,6 +792,10 @@ def _signal_processes(pids: Iterable[int], sig: int) -> None:
 def stop_account(account: Dict[str, Any], paths: RuntimePaths) -> Dict[str, Any]:
     del paths
     require_root("stop")
+    if runtime_provider(account) == "agent_wechat":
+        from agent_wechat_runtime import AgentWechatManager
+
+        return AgentWechatManager().stop(account)
     pids = account_processes(account)
     if not pids:
         result = status_for(account)
@@ -789,44 +841,89 @@ def print_result(value: Any, as_json: bool = False) -> None:
 
 
 def register_account(
-    registry: Registry, account_id: str, display_name: Optional[str], autostart: bool
+    registry: Registry,
+    account_id: str,
+    display_name: Optional[str],
+    autostart: bool,
+    label: Optional[str] = None,
+    provider: str = "legacy",
 ) -> Dict[str, Any]:
     validate_account_id(account_id)
     require_root("register")
+    provider = str(provider or "legacy").strip().lower()
+    if provider not in RUNTIME_PROVIDERS:
+        raise ValueError(f"runtime_provider must be one of {sorted(RUNTIME_PROVIDERS)}")
     with registry.locked():
         data = registry.load(create=True)
         if any(item["id"] == account_id for item in data["accounts"]):
             raise RuntimeErrorWithHint(f"account already exists: {account_id}")
-        uid = next_registry_uid(data)
-        account = {
-            "id": account_id,
-            "username": account_username(account_id),
-            "uid": uid,
-            "display": display_name or os.environ.get("DISPLAY", DEFAULT_DISPLAY),
-            "home": str(registry.paths.account_home_root / account_id / "home"),
-            "enabled": True,
-            "autostart": autostart,
-            "legacy": False,
-        }
+        if provider == "agent_wechat":
+            from agent_wechat_runtime import AgentWechatManager
+
+            safe_name = sanitize_account_runtime_name(account_id)
+            account = {
+                "id": account_id,
+                "display_name": (label or account_id).strip() or account_id,
+                "username": f"agent_{safe_name}",
+                "uid": None,
+                "display": "isolated",
+                "home": f"/config/agent-wechat/{safe_name}/home",
+                "enabled": True,
+                "autostart": autostart,
+                "legacy": False,
+                "runtime_provider": "agent_wechat",
+            }
+            manager = AgentWechatManager()
+            data_volume, home_volume = manager.storage_names(account)
+            account["agent_wechat"] = {
+                "container_name": manager.container_name(account),
+                "token_file": f"/config/agent-wechat/{safe_name}/auth-token",
+                "data_volume": data_volume,
+                "home_volume": home_volume,
+            }
+        else:
+            uid = next_registry_uid(data)
+            account = {
+                "id": account_id,
+                "display_name": (label or account_id).strip() or account_id,
+                "username": account_username(account_id),
+                "uid": uid,
+                "display": display_name or os.environ.get("DISPLAY", DEFAULT_DISPLAY),
+                "home": str(registry.paths.account_home_root / account_id / "home"),
+                "enabled": True,
+                "autostart": autostart,
+                "legacy": False,
+                "runtime_provider": "legacy",
+            }
         data["accounts"].append(account)
         bootstrap_account(account, registry.paths)
         registry.save(data)
         return account
 
 
-def unregister_account(registry: Registry, account_id: str) -> Dict[str, Any]:
+def unregister_account(
+    registry: Registry, account_id: str, *, purge_data: bool = False
+) -> Dict[str, Any]:
     require_root("unregister")
     with registry.locked():
         data = registry.load(create=True)
         account = find_account(data, account_id)
-        stop_account(account, registry.paths)
+        if runtime_provider(account) == "agent_wechat":
+            from agent_wechat_runtime import AgentWechatManager
+
+            removal = AgentWechatManager().remove(account, purge_data=purge_data)
+        else:
+            stop_account(account, registry.paths)
+            removal = {
+                "removed": account_id,
+                "data_preserved": account["home"],
+                "unix_user_preserved": account["username"],
+                "preserve_data": True,
+                "runtime_provider": "legacy",
+            }
         data["accounts"] = [item for item in data["accounts"] if item["id"] != account_id]
         registry.save(data)
-        return {
-            "removed": account_id,
-            "data_preserved": account["home"],
-            "unix_user_preserved": account["username"],
-        }
+        return removal
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -855,12 +952,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("register", help="add a persistent account")
     p.add_argument("account")
+    p.add_argument("--name", help="human-friendly account display name")
     p.add_argument("--display")
+    p.add_argument("--provider", choices=sorted(RUNTIME_PROVIDERS), default="legacy")
     p.add_argument("--no-autostart", action="store_true")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("unregister", help="remove registry entry, preserving home and Unix user")
     p.add_argument("account")
+    p.add_argument("--purge-data", action="store_true", help="also delete agent-wechat persistent data")
     p.add_argument("--json", action="store_true")
 
     return parser
@@ -884,13 +984,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.command == "register":
             result = register_account(
-                registry, args.account, args.display, not args.no_autostart
+                registry,
+                args.account,
+                args.display,
+                not args.no_autostart,
+                args.name,
+                args.provider,
             )
             print_result(result, args.json)
             return 0
 
         if args.command == "unregister":
-            result = unregister_account(registry, args.account)
+            result = unregister_account(registry, args.account, purge_data=args.purge_data)
             print_result(result, args.json)
             return 0
 
@@ -951,7 +1056,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0 if healthy else 1
 
         raise AssertionError(args.command)
-    except (RuntimeErrorWithHint, ValueError, subprocess.CalledProcessError) as exc:
+    except (RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"wechat-runtime: {exc}", file=sys.stderr)
         return 2
 

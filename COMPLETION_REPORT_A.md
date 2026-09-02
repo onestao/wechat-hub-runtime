@@ -66,6 +66,17 @@ Added because X11 focus, clipboard and synthetic input remain global when
 several isolated WeChat accounts share the same DISPLAY. Future Core sender UI
 operations can serialize their critical section with this helper.
 
+### Private Runtime account-control service
+
+Post-integration follow-up adds `wechat_runtime_control.py`, supervised by s6
+through LinuxServer Selkies' supported `/custom-services.d/wechat-runtime-control`
+hook. It exposes only a Unix-domain
+socket at `/run/wechat-runtime/control.sock` on the existing shared Runtime
+state volume. Core can now request list/register/start/stop/restart/unregister
+without Docker Socket access or host process privileges. The existing CLI
+remains available, and both paths operate on the same locked persisted
+registry. `register --name` also persists a human-friendly display name.
+
 ### Tests and runbooks
 
 - `tests/test_wechat_runtime.py`
@@ -105,7 +116,7 @@ python -m py_compile root/scripts/wechat/wechat_runtime.py \
   root/scripts/wechat/wechat-auto-login.py tests/test_wechat_runtime.py
 
 python -m unittest discover -s tests -v
-# 6 tests passed
+# 12 tests passed
 
 # Bash syntax after CRLF normalization (the Dockerfile performs this same normalization)
 bash -n ...
@@ -123,6 +134,17 @@ docker --version
 ```
 
 The Windows host therefore could not run the real test locally.
+
+Post-integration review added one startup-hardening regression: a stale
+`/run/wechat-runtime/bootstrap.ready` marker is removed before account
+bootstrap begins and recreated only after all account/UID reconciliation has
+finished. This prevents a Core container sharing persistent Runtime state from
+starting against an incompletely resolved registry after Runtime restart.
+
+The later Console-management follow-up adds a regression for persisted account
+display names and Runtime control action routing. The Unix-socket server is
+Linux-only at runtime but is deliberately import-safe on the Windows
+development host so its dispatch logic remains testable there.
 
 ## Unraid Gate 0 validation
 

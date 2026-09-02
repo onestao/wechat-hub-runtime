@@ -5,4 +5,9 @@ set -euo pipefail
 # also calls bootstrap, so a base-image ordering/race cannot leave accounts
 # half-created before /scripts/start.sh attempts to launch WeChat.
 mkdir -p /config/wechat-runtime
+# `/run/wechat-runtime` can be a shared/persistent integration volume.  Remove
+# any previous readiness marker before rebuilding the registry so dependent
+# services can never mistake stale state for a completed bootstrap.
+mkdir -p "${WECHAT_RUNTIME_DIR:-/run/wechat-runtime}"
+rm -f "${WECHAT_RUNTIME_DIR:-/run/wechat-runtime}/bootstrap.ready"
 /scripts/wechat/wechat-runtime bootstrap --json >/config/wechat-runtime/bootstrap-last.json

@@ -47,10 +47,13 @@ if [ "$AUTO_START_WECHAT" = "true" ]; then
     if [ -f /usr/bin/wechat ]; then
         if /scripts/wechat/wechat-runtime bootstrap >/dev/null 2>&1; then
             /scripts/wechat/wechat-runtime start-all --autostart-only || true
-        elif [ -z "${WECHAT_ACCOUNTS:-}" ]; then
+        elif [ -z "${WECHAT_ACCOUNTS:-}" ] \
+            && ! grep -q '"runtime_provider"[[:space:]]*:[[:space:]]*"agent_wechat"' /config/wechat-runtime/accounts.json 2>/dev/null; then
             # Compatibility fallback for hardened Selkies configurations where
-            # sudo is intentionally disabled. Explicit multi-account configs
-            # must never silently degrade to one global process.
+            # sudo is intentionally disabled. A persisted AgentWechat registry
+            # must never silently degrade to one global Legacy process, even if
+            # WECHAT_ACCOUNTS is empty because the accounts were created later
+            # through Console.
             echo "WARN: account bootstrap unavailable; using legacy single-account launch" >&2
             nohup /usr/bin/wechat > /dev/null 2>&1 &
             if [ "${ENABLE_WECHAT_AUTO_LOGIN:-true}" = "true" ]; then
