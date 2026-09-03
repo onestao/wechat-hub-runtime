@@ -316,6 +316,8 @@ class RuntimeRegistryTests(unittest.TestCase):
         self.assertTrue(any(item.get("Source") == "personal-data" and item.get("Target") == "/data" for item in mounts))
         self.assertTrue(any(item.get("Source") == "personal-home" and item.get("Target") == "/home/wechat" for item in mounts))
         self.assertTrue(any(item.get("Target") == "/data/auth-token" and item.get("ReadOnly") for item in mounts))
+        self.assertEqual(payload["HostConfig"]["PidsLimit"], 256)
+        self.assertEqual(payload["HostConfig"]["Memory"], 2048 * 1024 * 1024)
 
     def test_agent_health_distinguishes_container_server_and_login_state(self):
         account = {"id": "personal", "display_name": "Personal", "runtime_provider": "agent_wechat"}
@@ -446,12 +448,16 @@ class RuntimeRegistryTests(unittest.TestCase):
         self.assertEqual(payload["Labels"]["com.wechat-hub.provider"], "agent_wechat_selkies")
         env = set(payload["Env"])
         self.assertIn("DISPLAY=:99", env)
-        self.assertIn("SELKIES_CLIPBOARD_ENABLED=true|locked", env)
-        self.assertIn("SELKIES_ENABLE_BINARY_CLIPBOARD=true|locked", env)
+        self.assertIn("SELKIES_CLIPBOARD_ENABLED=false|locked", env)
+        self.assertIn("SELKIES_ENABLE_BINARY_CLIPBOARD=false|locked", env)
         self.assertIn("SELKIES_FILE_TRANSFERS=upload,download", env)
         self.assertIn("SELKIES_COMMAND_ENABLED=false|locked", env)
+        self.assertIn("SELKIES_UI_SIDEBAR_SHOW_CLIPBOARD=false|locked", env)
         self.assertIn("SELKIES_UI_SIDEBAR_SHOW_SCREEN_SETTINGS=true|locked", env)
         self.assertFalse(any(item.startswith("SELKIES_BASIC_AUTH_PASSWORD=") for item in env))
+        self.assertEqual(host["PidsLimit"], 100)
+        self.assertEqual(host["Memory"], 1024 * 1024 * 1024)
+        self.assertEqual(host["NanoCpus"], 2000000000)
 
     def test_selkies_health_probe_uses_private_desktop_header_not_basic_auth(self):
         account = {"id": "alpha", "display_name": "Alpha", "runtime_provider": "agent_wechat"}
@@ -545,7 +551,8 @@ class RuntimeRegistryTests(unittest.TestCase):
             self.assertRegex(desktop["path"], r"^/desktop/[A-Za-z0-9_-]+/$")
             self.assertNotIn("token=", desktop["path"])
             self.assertTrue(desktop["features"]["local_ime"])
-            self.assertTrue(desktop["features"]["clipboard_text"])
+            self.assertFalse(desktop["features"]["clipboard_text"])
+            self.assertFalse(desktop["features"]["clipboard_image"])
             self.assertTrue(desktop["features"]["file_upload"])
             self.assertTrue(desktop["features"]["dynamic_resize"])
             descriptors = [json.loads(path.read_text(encoding="utf-8")) for path in Path(temp).glob("*.json")]
@@ -1386,6 +1393,178 @@ class RuntimeRegistryTests(unittest.TestCase):
             result = wechat_runtime_control._list_status_for(account)
         self.assertEqual(result, expected)
         status.assert_called_once_with(account, probe_timeout=wechat_runtime_control.LIST_AGENT_PROBE_TIMEOUT)
+
+    def test_selkies_clipboard_override_via_env(self):
+        with patch.dict(os.environ, {"WECHAT_SELKIES_CLIPBOARD_ENABLED": "true"}, clear=False):
+            features = agent_wechat_runtime.selkies_desktop_features()
+            self.assertTrue(features["clipboard_text"])
+            self.assertTrue(features["clipboard_image"])
+            env = set(agent_wechat_runtime._selkies_attach_env())
+            self.assertIn("SELKIES_CLIPBOARD_ENABLED=true|locked", env)
+            self.assertIn("SELKIES_ENABLE_BINARY_CLIPBOARD=true|locked", env)
+            self.assertIn("SELKIES_UI_SIDEBAR_SHOW_CLIPBOARD=true|locked", env)
+
+        with patch.dict(os.environ, {"WECHAT_SELKIES_CLIPBOARD_ENABLED": "false"}, clear=False):
+            features = agent_wechat_runtime.selkies_desktop_features()
+            self.assertFalse(features["clipboard_text"])
+            self.assertFalse(features["clipboard_image"])
+            env = set(agent_wechat_runtime._selkies_attach_env())
+            self.assertIn("SELKIES_CLIPBOARD_ENABLED=false|locked", env)
+            self.assertIn("SELKIES_ENABLE_BINARY_CLIPBOARD=false|locked", env)
+            self.assertIn("SELKIES_UI_SIDEBAR_SHOW_CLIPBOARD=false|locked", env)
+
+    def test_companion_pids_limit_and_resource_caps_override(self):
+        account = {"id": "beta", "display_name": "Beta", "runtime_provider": "agent_wechat"}
+        manager = agent_wechat_runtime.AgentWechatManager(engine=object())
+        with patch.dict(
+            os.environ,
+            {
+                "WECHAT_SELKIES_PIDS_LIMIT": "50",
+                "WECHAT_SELKIES_MEM_LIMIT_MB": "512",
+                "WECHAT_SELKIES_CPU_LIMIT_CORES": "1.5",
+            },
+            clear=False,
+        ), patch.object(manager, "selkies_image_for", return_value="sha256:img"):
+            payload = manager._selkies_payload(
+                account,
+                parent_container_id="agent-beta-id",
+                x11_volume="beta-x11",
+                browser_files_volume="beta-files",
+                host_desktop_token="/host/token",
+            )
+        host = payload["HostConfig"]
+        self.assertEqual(host["PidsLimit"], 50)
+        self.assertEqual(host["Memory"], 512 * 1024 * 1024)
+        self.assertEqual(host["NanoCpus"], 1500000000)
+
+    def test_desktop_session_release_cleans_up_companion_container(self):
+        import unittest.mock
+        removed_accounts = []
+        mock_manager = unittest.mock.MagicMock()
+        mock_manager._remove_selkies_container = lambda acc: removed_accounts.append(acc["id"])
+        with patch("desktop_gateway.AgentWechatManager", return_value=mock_manager), patch.dict(
+            os.environ, {"WECHAT_SELKIES_IDLE_TTL_SECONDS": "0"}, clear=False
+        ):
+            self.assertTrue(desktop_gateway.acquire_manual_gui_lease("test-acc", "sess-1"))
+            desktop_gateway.release_manual_gui_lease("test-acc", "sess-1")
+            self.assertIn("test-acc", removed_accounts)
+
+    def test_ensure_selkies_desktop_cleans_up_on_probe_failure(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-fail", "display_name": "Fail", "runtime_provider": "agent_wechat"}
+        primary_id = engine.create_container(
+            "wechat-agent-acc-fail",
+            {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-fail"),
+                "HostConfig": {
+                    "Mounts": [
+                        {"Target": "/tmp/.X11-unix"},
+                        {"Target": "/home/wechat/WeChatHubFiles"},
+                    ]
+                },
+            },
+        )["Id"]
+        engine.start_container(primary_id)
+        with patch.object(
+            manager, "_host_config_root_and_network", return_value=("/host/root", "wechat-hub_net")
+        ), patch.object(
+            manager, "_ensure_desktop_volumes", return_value=("x11-vol", "files-vol")
+        ), patch.object(
+            manager, "_desktop_token_host_path", return_value="/host/token"
+        ), patch.object(
+            manager, "selkies_image_for", return_value="sha256:rt-image"
+        ), patch.object(
+            manager, "_probe_selkies", return_value=(False, "Connection refused")
+        ), patch("time.monotonic", side_effect=[0.0, 1.0, 20.0]):
+            with self.assertRaises(agent_wechat_runtime.AgentWechatRuntimeError):
+                manager.ensure_selkies_desktop(account)
+            # Verify companion container was removed after failure
+            self.assertEqual(engine.managed_containers("acc-fail", provider="agent_wechat_selkies"), [])
+
+
+    def test_companion_failure_on_a_does_not_affect_b_desktop(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account_a = {"id": "acc-a", "display_name": "A", "runtime_provider": "agent_wechat"}
+        account_b = {"id": "acc-b", "display_name": "B", "runtime_provider": "agent_wechat"}
+
+        for acc in (account_a, account_b):
+            pid = engine.create_container(
+                f"wechat-agent-{acc['id']}",
+                {
+                    "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                    "Labels": agent_wechat_runtime._labels(acc["id"]),
+                    "HostConfig": {
+                        "Mounts": [
+                            {"Target": "/tmp/.X11-unix"},
+                            {"Target": "/home/wechat/WeChatHubFiles"},
+                        ]
+                    },
+                },
+            )["Id"]
+            engine.start_container(pid)
+
+        def fake_probe(acc, timeout=1.0):
+            if acc["id"] == "acc-a":
+                return (False, "A companion PIDs limit / fork failure")
+            return (True, "")
+
+        with patch.object(
+            manager, "_host_config_root_and_network", return_value=("/host/root", "wechat-hub_net")
+        ), patch.object(
+            manager, "_ensure_desktop_volumes", return_value=("x11-vol", "files-vol")
+        ), patch.object(
+            manager, "_desktop_token_host_path", return_value="/host/token"
+        ), patch.object(
+            manager, "selkies_image_for", return_value="sha256:rt-image"
+        ), patch.object(
+            manager, "_probe_selkies", side_effect=fake_probe
+        ), patch("time.monotonic", side_effect=[0.0, 1.0, 20.0, 0.0, 1.0]):
+            with self.assertRaises(agent_wechat_runtime.AgentWechatRuntimeError):
+                manager.ensure_selkies_desktop(account_a)
+            self.assertEqual(engine.managed_containers("acc-a", provider="agent_wechat_selkies"), [])
+
+            res_b = manager.ensure_selkies_desktop(account_b)
+            self.assertEqual(res_b["account_id"], "acc-b")
+            self.assertEqual(res_b["desktop_provider"], "selkies")
+            self.assertEqual(len(engine.managed_containers("acc-b", provider="agent_wechat_selkies")), 1)
+
+    def test_runtime_account_api_returns_fast_degraded_when_companion_fails(self):
+        account = {"id": "acc-degraded", "display_name": "Degraded", "runtime_provider": "agent_wechat"}
+        manager = agent_wechat_runtime.AgentWechatManager(engine=FakeDockerEngine())
+        inspected = {
+            "Id": "fake-degraded",
+            "Name": "/wechat-agent-acc-degraded",
+            "Config": {"Image": "ghcr.io/thisnick/agent-wechat:0.11.15"},
+            "State": {"Running": True},
+            "NetworkSettings": {"Ports": {}},
+        }
+        with patch.object(manager, "_find_container", return_value=inspected):
+            with patch.object(manager, "_probe_agent_server", return_value=(False, "PIDs limit reached: fork rejected")):
+                status = manager.status(account, probe_timeout=1.0)
+                self.assertEqual(status["runtime_health"], "degraded")
+                self.assertFalse(status["agent_server_healthy"])
+                self.assertIn("PIDs limit", status["health_error"])
+
+    def test_repeated_session_acquire_release_has_bounded_idle_reap(self):
+        removed = []
+        mock_manager = unittest.mock.MagicMock()
+        mock_manager._remove_selkies_container = lambda acc: removed.append(acc["id"])
+
+        with patch("desktop_gateway.AgentWechatManager", return_value=mock_manager), patch.dict(
+            os.environ, {"WECHAT_SELKIES_IDLE_TTL_SECONDS": "0"}, clear=False
+        ):
+            for i in range(50):
+                sess = f"sess-{i}"
+                self.assertTrue(desktop_gateway.acquire_manual_gui_lease("acc-churn", sess))
+                desktop_gateway.release_manual_gui_lease("acc-churn", sess)
+
+            with desktop_gateway._MANUAL_GUI_LEASES_GUARD:
+                self.assertNotIn("acc-churn", desktop_gateway._MANUAL_GUI_LEASES)
+            self.assertEqual(len(desktop_gateway._IDLE_CLEANUP_TIMERS), 0)
+            self.assertEqual(len(removed), 50)
 
 
 if __name__ == "__main__":

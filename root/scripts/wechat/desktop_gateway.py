@@ -72,6 +72,56 @@ class GatewaySessionError(RuntimeError):
 
 _MANUAL_GUI_LEASES: dict[str, dict[str, Any]] = {}
 _MANUAL_GUI_LEASES_GUARD = threading.Lock()
+_IDLE_CLEANUP_TIMERS: dict[str, Any] = {}
+
+
+def _cleanup_idle_selkies_companion(account_key: str) -> None:
+    try:
+        manager = AgentWechatManager()
+        account = {"id": account_key}
+        manager._remove_selkies_container(account)
+    except Exception:
+        pass
+
+
+def cancel_idle_selkies_cleanup(account_key: str) -> None:
+    timer = _IDLE_CLEANUP_TIMERS.pop(str(account_key), None)
+    if timer is not None:
+        try:
+            timer.cancel()
+        except Exception:
+            pass
+
+
+def schedule_idle_selkies_cleanup(account_key: str, delay_seconds: float | None = None) -> None:
+    cancel_idle_selkies_cleanup(account_key)
+    if delay_seconds is None:
+        try:
+            delay_seconds = max(0.0, float(os.environ.get("WECHAT_SELKIES_IDLE_TTL_SECONDS", "10.0")))
+        except ValueError:
+            delay_seconds = 10.0
+
+    if delay_seconds <= 0.0:
+        _cleanup_idle_selkies_companion(account_key)
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is None:
+        _cleanup_idle_selkies_companion(account_key)
+        return
+
+    def _fire():
+        _IDLE_CLEANUP_TIMERS.pop(str(account_key), None)
+        with _MANUAL_GUI_LEASES_GUARD:
+            if str(account_key) in _MANUAL_GUI_LEASES:
+                return
+        _cleanup_idle_selkies_companion(account_key)
+
+    _IDLE_CLEANUP_TIMERS[str(account_key)] = loop.call_later(delay_seconds, _fire)
 
 
 def _account_gui_lease_path(account_id: str) -> Path:
@@ -113,6 +163,7 @@ def acquire_manual_gui_lease(account_id: str, session_id: str) -> bool:
             except OSError:
                 handle.close()
                 return False
+        cancel_idle_selkies_cleanup(account_key)
         _MANUAL_GUI_LEASES[account_key] = {
             "session_id": str(session_id),
             "count": 1,
@@ -124,6 +175,7 @@ def acquire_manual_gui_lease(account_id: str, session_id: str) -> bool:
 def release_manual_gui_lease(account_id: str, session_id: str) -> None:
     account_key = str(account_id)
     handle = None
+    last_session_closed = False
     with _MANUAL_GUI_LEASES_GUARD:
         existing = _MANUAL_GUI_LEASES.get(account_key)
         if existing is None or str(existing.get("session_id") or "") != str(session_id):
@@ -134,12 +186,15 @@ def release_manual_gui_lease(account_id: str, session_id: str) -> None:
             return
         handle = existing.get("handle")
         _MANUAL_GUI_LEASES.pop(account_key, None)
+        last_session_closed = True
     if handle is not None:
         try:
             if fcntl is not None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
+    if last_session_closed:
+        schedule_idle_selkies_cleanup(account_key)
 
 
 def _configured_mib(name: str, default: int, *, minimum: int, maximum: int) -> int:

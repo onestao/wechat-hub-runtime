@@ -48,13 +48,26 @@ SELKIES_DESKTOP_FEATURES = {
     "mouse": True,
     "keyboard": True,
     "local_ime": True,
-    "clipboard_text": True,
-    "clipboard_image": True,
+    "clipboard_text": False,
+    "clipboard_image": False,
     "file_upload": True,
     "file_download": True,
     "dynamic_resize": True,
     "dpi_scaling": True,
 }
+
+
+def _selkies_clipboard_enabled() -> bool:
+    val = os.environ.get("WECHAT_SELKIES_CLIPBOARD_ENABLED", "false").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def selkies_desktop_features() -> dict[str, bool]:
+    features = dict(SELKIES_DESKTOP_FEATURES)
+    enabled = _selkies_clipboard_enabled()
+    features["clipboard_text"] = enabled
+    features["clipboard_image"] = enabled
+    return features
 
 NOVNC_DESKTOP_FEATURES = {
     "mouse": True,
@@ -99,6 +112,8 @@ env -u LD_PRELOAD selkies --addr=127.0.0.1 --port=8082 --mode=websockets --enabl
 selkies_pid=$!
 cleanup() {
   kill "$selkies_pid" 2>/dev/null || true
+  pkill -P "$selkies_pid" 2>/dev/null || true
+  pkill -u wechat xclip 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 exec python3 /scripts/wechat/selkies_attach_gateway.py
@@ -106,44 +121,49 @@ exec python3 /scripts/wechat/selkies_attach_gateway.py
 ]
 
 
-SELKIES_ATTACH_ENV = [
-    "DISPLAY=:99",
-    "HOME=/config",
-    "USER=wechat",
-    "LOGNAME=wechat",
-    "LANG=zh_CN.UTF-8",
-    "LC_ALL=zh_CN.UTF-8",
-    "SELKIES_UI_TITLE=微信桌面",
-    "SELKIES_UI_SHOW_LOGO=false|locked",
-    "SELKIES_AUDIO_ENABLED=false|locked",
-    "SELKIES_MICROPHONE_ENABLED=false|locked",
-    "SELKIES_GAMEPAD_ENABLED=false|locked",
-    "SELKIES_CLIPBOARD_ENABLED=true|locked",
-    "SELKIES_CLIPBOARD_IN_ENABLED=true|locked",
-    "SELKIES_CLIPBOARD_OUT_ENABLED=true|locked",
-    "SELKIES_ENABLE_BINARY_CLIPBOARD=true|locked",
-    "SELKIES_COMMAND_ENABLED=false|locked",
-    "SELKIES_FILE_TRANSFERS=upload,download",
-    "SELKIES_SECOND_SCREEN=false|locked",
-    "SELKIES_ENABLE_SHARING=false|locked",
-    "SELKIES_ENABLE_COLLAB=false|locked",
-    "SELKIES_ENABLE_SHARED=false|locked",
-    "SELKIES_ENABLE_PLAYER2=false|locked",
-    "SELKIES_ENABLE_PLAYER3=false|locked",
-    "SELKIES_ENABLE_PLAYER4=false|locked",
-    "SELKIES_UI_SIDEBAR_SHOW_AUDIO_SETTINGS=false|locked",
-    "SELKIES_UI_SIDEBAR_SHOW_APPS=false|locked",
-    "SELKIES_UI_SIDEBAR_SHOW_SHARING=false|locked",
-    "SELKIES_UI_SIDEBAR_SHOW_GAMEPADS=false|locked",
-    "SELKIES_UI_SIDEBAR_SHOW_GAMING_MODE=false|locked",
-    "SELKIES_UI_SIDEBAR_SHOW_CLIPBOARD=true|locked",
-    "SELKIES_UI_SIDEBAR_SHOW_FILES=true|locked",
-    "SELKIES_UI_SIDEBAR_SHOW_SCREEN_SETTINGS=true|locked",
-    "SELKIES_UI_SIDEBAR_SHOW_FULLSCREEN=true|locked",
-    "SELKIES_UI_SIDEBAR_SHOW_TRACKPAD=true|locked",
-    "SELKIES_UI_SIDEBAR_SHOW_KEYBOARD_BUTTON=true|locked",
-    "SELKIES_SCALING_DPI=96,120,144,168,192,216,240,264,288",
-]
+def _selkies_attach_env() -> list[str]:
+    clipboard_val = "true|locked" if _selkies_clipboard_enabled() else "false|locked"
+    return [
+        "DISPLAY=:99",
+        "HOME=/config",
+        "USER=wechat",
+        "LOGNAME=wechat",
+        "LANG=zh_CN.UTF-8",
+        "LC_ALL=zh_CN.UTF-8",
+        "SELKIES_UI_TITLE=微信桌面",
+        "SELKIES_UI_SHOW_LOGO=false|locked",
+        "SELKIES_AUDIO_ENABLED=false|locked",
+        "SELKIES_MICROPHONE_ENABLED=false|locked",
+        "SELKIES_GAMEPAD_ENABLED=false|locked",
+        f"SELKIES_CLIPBOARD_ENABLED={clipboard_val}",
+        f"SELKIES_CLIPBOARD_IN_ENABLED={clipboard_val}",
+        f"SELKIES_CLIPBOARD_OUT_ENABLED={clipboard_val}",
+        f"SELKIES_ENABLE_BINARY_CLIPBOARD={clipboard_val}",
+        "SELKIES_COMMAND_ENABLED=false|locked",
+        "SELKIES_FILE_TRANSFERS=upload,download",
+        "SELKIES_SECOND_SCREEN=false|locked",
+        "SELKIES_ENABLE_SHARING=false|locked",
+        "SELKIES_ENABLE_COLLAB=false|locked",
+        "SELKIES_ENABLE_SHARED=false|locked",
+        "SELKIES_ENABLE_PLAYER2=false|locked",
+        "SELKIES_ENABLE_PLAYER3=false|locked",
+        "SELKIES_ENABLE_PLAYER4=false|locked",
+        "SELKIES_UI_SIDEBAR_SHOW_AUDIO_SETTINGS=false|locked",
+        "SELKIES_UI_SIDEBAR_SHOW_APPS=false|locked",
+        "SELKIES_UI_SIDEBAR_SHOW_SHARING=false|locked",
+        "SELKIES_UI_SIDEBAR_SHOW_GAMEPADS=false|locked",
+        "SELKIES_UI_SIDEBAR_SHOW_GAMING_MODE=false|locked",
+        f"SELKIES_UI_SIDEBAR_SHOW_CLIPBOARD={clipboard_val}",
+        "SELKIES_UI_SIDEBAR_SHOW_FILES=true|locked",
+        "SELKIES_UI_SIDEBAR_SHOW_SCREEN_SETTINGS=true|locked",
+        "SELKIES_UI_SIDEBAR_SHOW_FULLSCREEN=true|locked",
+        "SELKIES_UI_SIDEBAR_SHOW_TRACKPAD=true|locked",
+        "SELKIES_UI_SIDEBAR_SHOW_KEYBOARD_BUTTON=true|locked",
+        "SELKIES_SCALING_DPI=96,120,144,168,192,216,240,264,288",
+    ]
+
+
+SELKIES_ATTACH_ENV = _selkies_attach_env()
 
 # Fixed, account-independent command template.  Console/API input is never
 # interpolated into this shell program.  It only reconciles the upstream
@@ -757,8 +777,12 @@ class AgentWechatManager:
         host_desktop_token: str,
     ) -> dict[str, Any]:
         labels = self._desktop_labels(account, parent_container_id)
-        env = list(SELKIES_ATTACH_ENV)
+        env = list(_selkies_attach_env())
         env.append(f"WECHAT_ACCOUNT_ID={account['id']}")
+        pids_limit = int(os.environ.get("WECHAT_SELKIES_PIDS_LIMIT", "100"))
+        mem_limit_mb = int(os.environ.get("WECHAT_SELKIES_MEM_LIMIT_MB", "1024"))
+        cpu_cores = float(os.environ.get("WECHAT_SELKIES_CPU_LIMIT_CORES", "2.0"))
+
         host_config: dict[str, Any] = {
             "Mounts": [
                 {"Type": "volume", "Source": x11_volume, "Target": "/tmp/.X11-unix"},
@@ -777,6 +801,9 @@ class AgentWechatManager:
             "IpcMode": f"container:{parent_container_id}",
             "NetworkMode": f"container:{parent_container_id}",
             "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+            "PidsLimit": pids_limit,
+            "Memory": mem_limit_mb * 1024 * 1024,
+            "NanoCpus": int(cpu_cores * 1e9),
         }
         devices = self._runtime_dri_devices()
         if devices:
@@ -862,43 +889,47 @@ class AgentWechatManager:
                 self._remove_selkies_container(account)
                 existing = None
 
-        if existing is None:
-            payload = self._selkies_payload(
-                account,
-                parent_container_id=parent_id,
-                x11_volume=x11_volume,
-                browser_files_volume=browser_files_volume,
-                host_desktop_token=host_desktop_token,
-            )
-            created = self.engine.create_container(self.desktop_container_name(account), payload)
-            identifier = str(created.get("Id") or self.desktop_container_name(account))
-            existing = self.engine.inspect_container(identifier)
-        if existing is None:
-            raise AgentWechatRuntimeError("Selkies desktop creation did not produce an inspectable container")
+        try:
+            if existing is None:
+                payload = self._selkies_payload(
+                    account,
+                    parent_container_id=parent_id,
+                    x11_volume=x11_volume,
+                    browser_files_volume=browser_files_volume,
+                    host_desktop_token=host_desktop_token,
+                )
+                created = self.engine.create_container(self.desktop_container_name(account), payload)
+                identifier = str(created.get("Id") or self.desktop_container_name(account))
+                existing = self.engine.inspect_container(identifier)
+            if existing is None:
+                raise AgentWechatRuntimeError("Selkies desktop creation did not produce an inspectable container")
 
-        identifier = str(existing.get("Id") or self.desktop_container_name(account))
-        if not bool((existing.get("State") or {}).get("Running")):
-            self.engine.start_container(identifier)
+            identifier = str(existing.get("Id") or self.desktop_container_name(account))
+            if not bool((existing.get("State") or {}).get("Running")):
+                self.engine.start_container(identifier)
 
-        deadline = time.monotonic() + 15.0
-        last_error = "Selkies desktop did not become ready"
-        while time.monotonic() < deadline:
-            healthy, last_error = self._probe_selkies(account, timeout=1.0)
-            if healthy:
-                return {
-                    "account_id": str(account["id"]),
-                    "desktop_provider": "selkies",
-                    "container_name": self.desktop_container_name(account),
-                    "port": SELKIES_ATTACH_PORT,
-                    "display": ":99",
-                    "features": dict(SELKIES_DESKTOP_FEATURES),
-                    "browser_files_path": "/home/wechat/WeChatHubFiles/Desktop",
-                }
-            time.sleep(0.25)
-        # A broken companion must not sit around consuming resources.  The
-        # caller may safely fall back to noVNC without touching WeChat.
-        self._remove_selkies_container(account)
-        raise AgentWechatRuntimeError(last_error)
+            deadline = time.monotonic() + 15.0
+            last_error = "Selkies desktop did not become ready"
+            while time.monotonic() < deadline:
+                healthy, last_error = self._probe_selkies(account, timeout=1.0)
+                if healthy:
+                    return {
+                        "account_id": str(account["id"]),
+                        "desktop_provider": "selkies",
+                        "container_name": self.desktop_container_name(account),
+                        "port": SELKIES_ATTACH_PORT,
+                        "display": ":99",
+                        "features": dict(selkies_desktop_features()),
+                        "browser_files_path": "/home/wechat/WeChatHubFiles/Desktop",
+                    }
+                time.sleep(0.25)
+            # A broken companion must not sit around consuming resources.  The
+            # caller may safely fall back to noVNC without touching WeChat.
+            self._remove_selkies_container(account)
+            raise AgentWechatRuntimeError(last_error)
+        except Exception:
+            self._remove_selkies_container(account)
+            raise
 
     def _container_payload(
         self,
@@ -947,6 +978,8 @@ class AgentWechatManager:
                 # the shared internal WeChat Hub Docker network.
                 "NetworkMode": network,
                 "ShmSize": shm_size,
+                "PidsLimit": int(os.environ.get("AGENT_WECHAT_PIDS_LIMIT", "256")),
+                "Memory": int(os.environ.get("AGENT_WECHAT_MEM_LIMIT_MB", "2048")) * 1024 * 1024,
             },
             "NetworkingConfig": {"EndpointsConfig": {network: {"Aliases": [name]}}},
         }
@@ -1626,7 +1659,7 @@ class AgentWechatManager:
             try:
                 selkies = self.ensure_selkies_desktop(account)
                 selected_provider = "selkies"
-                features = dict(selkies.get("features") or SELKIES_DESKTOP_FEATURES)
+                features = dict(selkies.get("features") or selkies_desktop_features())
             except AgentWechatRuntimeError as exc:
                 if requested_provider == "selkies":
                     raise
