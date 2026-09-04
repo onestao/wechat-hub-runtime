@@ -16,6 +16,8 @@ jobs:
   export:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
       - name: Login to GHCR
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
         with:
@@ -40,6 +42,8 @@ jobs:
           set -euo pipefail
           tag="v${{ inputs.rc_tag }}"
           gh release create "$tag" "wechat-hub-runtime-${{ inputs.rc_tag }}.tar.zst" \
+            --repo onestao/wechat-hub-runtime \
+            --target feat/multi-account-runtime \
             --title "$tag" \
             --notes "P0 rc.2 immutable image asset for NAS offline transfer" \
-            || gh release upload "$tag" "wechat-hub-runtime-${{ inputs.rc_tag }}.tar.zst" --clobber
+            || gh release upload "$tag" "wechat-hub-runtime-${{ inputs.rc_tag }}.tar.zst" --repo onestao/wechat-hub-runtime --clobber
