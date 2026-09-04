@@ -497,6 +497,22 @@ class RuntimeRegistryTests(unittest.TestCase):
         self.assertEqual(headers["x-wechat-hub-desktop-token"], "d" * 64)
         self.assertNotIn("authorization", headers)
 
+    def test_selkies_health_probe_accepts_426_upgrade_required(self):
+        account = {"id": "alpha", "display_name": "Alpha", "runtime_provider": "agent_wechat"}
+        manager = agent_wechat_runtime.AgentWechatManager(engine=object())
+
+        def urlopen(request, timeout=0):
+            import urllib.error
+            raise urllib.error.HTTPError(request.full_url, 426, "Upgrade Required", {}, None)
+
+        with patch.object(manager, "_desktop_token", return_value="d" * 64), patch.object(
+            agent_wechat_runtime.urllib.request, "urlopen", side_effect=urlopen
+        ):
+            healthy, error = manager._probe_selkies(account, timeout=1.5)
+
+        self.assertTrue(healthy)
+        self.assertEqual(error, "")
+
     def test_x11_socket_reset_does_not_touch_persistent_account_files(self):
         account = {"id": "alpha", "display_name": "Alpha", "runtime_provider": "agent_wechat"}
         manager = agent_wechat_runtime.AgentWechatManager(engine=object())

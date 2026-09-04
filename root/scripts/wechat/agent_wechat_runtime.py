@@ -881,10 +881,12 @@ class AgentWechatManager:
             with urllib.request.urlopen(request, timeout=max(0.25, timeout)) as response:
                 response.read(64 * 1024)
                 status = int(getattr(response, "status", 200))
-                if 200 <= status < 400:
+                if 200 <= status < 400 or status == 426:
                     return True, ""
                 return False, f"Selkies desktop returned HTTP {status}"
         except urllib.error.HTTPError as exc:
+            if exc.code == 426:
+                return True, ""
             return False, f"Selkies desktop returned HTTP {exc.code}"
         except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException) as exc:
             return False, f"Selkies desktop health failed: {exc}"
@@ -1026,6 +1028,7 @@ class AgentWechatManager:
                 # Runtime and Desktop Gateway reach this account only through
                 # the shared internal WeChat Hub Docker network.
                 "NetworkMode": network,
+                "IpcMode": "shareable",
                 "ShmSize": shm_size,
                 "PidsLimit": _bounded_int_env(
                     "AGENT_WECHAT_PIDS_LIMIT", 256, minimum=64, maximum=1024
