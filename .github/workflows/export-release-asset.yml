@@ -1,0 +1,45 @@
+name: Export Release Asset
+
+on:
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: "RC tag to export"
+        required: true
+        default: "0.1.0-rc.2"
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull, Save and Compress Image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/onestao/wechat-hub-runtime:${{ inputs.rc_tag }}"
+          docker pull "$image"
+          docker save "$image" | zstd -T0 -1 -o "wechat-hub-runtime-${{ inputs.rc_tag }}.tar.zst"
+          ls -lh "wechat-hub-runtime-${{ inputs.rc_tag }}.tar.zst"
+
+      - name: Create Release and Upload Asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="v${{ inputs.rc_tag }}"
+          gh release create "$tag" "wechat-hub-runtime-${{ inputs.rc_tag }}.tar.zst" \
+            --title "$tag" \
+            --notes "P0 rc.2 immutable image asset for NAS offline transfer" \
+            || gh release upload "$tag" "wechat-hub-runtime-${{ inputs.rc_tag }}.tar.zst" --clobber
