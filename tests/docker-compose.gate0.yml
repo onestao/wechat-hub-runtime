@@ -4,5 +4,12 @@ services:
     # a shared Docker host such as Unraid.
     container_name: wechat-hub-a-gate0-runtime
     restart: "no"
+    pids_limit: 200
+    environment:
+      - SELKIES_CLIPBOARD_ENABLED=false|locked
+      - SELKIES_CLIPBOARD_IN_ENABLED=false|locked
+      - SELKIES_CLIPBOARD_OUT_ENABLED=false|locked
+      - SELKIES_ENABLE_BINARY_CLIPBOARD=false|locked
+      - SELKIES_UI_SIDEBAR_SHOW_CLIPBOARD=false|locked
     labels:
       com.wechat-hub.gate0: "session-a"

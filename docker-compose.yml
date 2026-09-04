@@ -34,4 +34,12 @@ services:
       # Optional per-account X display overrides: work=:1,test=:1
       - WECHAT_ACCOUNT_DISPLAY_MAP=${WECHAT_ACCOUNT_DISPLAY_MAP:-}
       - WECHAT_LEGACY_DEFAULT_ACCOUNT=${WECHAT_LEGACY_DEFAULT_ACCOUNT:-true}
+      # P0: baseimage-selkies clipboard must remain disabled in the Runtime
+      # Manager itself. This is separate from the AgentWechat companion flag.
+      - SELKIES_CLIPBOARD_ENABLED=false|locked
+      - SELKIES_CLIPBOARD_IN_ENABLED=false|locked
+      - SELKIES_CLIPBOARD_OUT_ENABLED=false|locked
+      - SELKIES_ENABLE_BINARY_CLIPBOARD=false|locked
+      - SELKIES_UI_SIDEBAR_SHOW_CLIPBOARD=false|locked
     shm_size: "${SHM_SIZE:-1gb}"        # recommended, will improve performance
+    pids_limit: 200

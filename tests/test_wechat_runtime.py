@@ -411,7 +411,7 @@ class RuntimeRegistryTests(unittest.TestCase):
             )
 
         self.assertEqual(payload["Image"], "sha256:runtime-image")
-        self.assertEqual(payload["Entrypoint"], ["/bin/sh", "-c"])
+        self.assertEqual(payload["Entrypoint"], ["/bin/bash", "-c"])
         command = payload["Cmd"][0]
         self.assertIn("selkies --addr=127.0.0.1", command)
         self.assertIn("--mode=websockets", command)
@@ -419,12 +419,16 @@ class RuntimeRegistryTests(unittest.TestCase):
         self.assertIn("--addr=127.0.0.1", command)
         self.assertIn("--port=8082", command)
         self.assertIn("--enable-basic-auth=false", command)
-        self.assertIn("exec python3 /scripts/wechat/selkies_attach_gateway.py", command)
+        self.assertIn("python3 /scripts/wechat/selkies_attach_gateway.py &", command)
+        self.assertIn('wait -n "$selkies_pid" "$proxy_pid"', command)
+        self.assertNotIn("exec python3 /scripts/wechat/selkies_attach_gateway.py", command)
+        self.assertNotIn("pkill -u wechat xclip", command)
         self.assertNotIn("Xvfb", command)
         self.assertNotIn("/usr/bin/wechat", command)
         host = payload["HostConfig"]
         self.assertEqual(host["IpcMode"], "container:agent-alpha-id")
         self.assertEqual(host["NetworkMode"], "container:agent-alpha-id")
+        self.assertTrue(host["Init"])
         self.assertNotIn("PortBindings", host)
         mounts = host["Mounts"]
         self.assertIn(
@@ -1394,15 +1398,15 @@ class RuntimeRegistryTests(unittest.TestCase):
         self.assertEqual(result, expected)
         status.assert_called_once_with(account, probe_timeout=wechat_runtime_control.LIST_AGENT_PROBE_TIMEOUT)
 
-    def test_selkies_clipboard_override_via_env(self):
+    def test_selkies_clipboard_cannot_be_reenabled_by_env_in_rc2(self):
         with patch.dict(os.environ, {"WECHAT_SELKIES_CLIPBOARD_ENABLED": "true"}, clear=False):
             features = agent_wechat_runtime.selkies_desktop_features()
-            self.assertTrue(features["clipboard_text"])
-            self.assertTrue(features["clipboard_image"])
+            self.assertFalse(features["clipboard_text"])
+            self.assertFalse(features["clipboard_image"])
             env = set(agent_wechat_runtime._selkies_attach_env())
-            self.assertIn("SELKIES_CLIPBOARD_ENABLED=true|locked", env)
-            self.assertIn("SELKIES_ENABLE_BINARY_CLIPBOARD=true|locked", env)
-            self.assertIn("SELKIES_UI_SIDEBAR_SHOW_CLIPBOARD=true|locked", env)
+            self.assertIn("SELKIES_CLIPBOARD_ENABLED=false|locked", env)
+            self.assertIn("SELKIES_ENABLE_BINARY_CLIPBOARD=false|locked", env)
+            self.assertIn("SELKIES_UI_SIDEBAR_SHOW_CLIPBOARD=false|locked", env)
 
         with patch.dict(os.environ, {"WECHAT_SELKIES_CLIPBOARD_ENABLED": "false"}, clear=False):
             features = agent_wechat_runtime.selkies_desktop_features()
@@ -1412,6 +1416,30 @@ class RuntimeRegistryTests(unittest.TestCase):
             self.assertIn("SELKIES_CLIPBOARD_ENABLED=false|locked", env)
             self.assertIn("SELKIES_ENABLE_BINARY_CLIPBOARD=false|locked", env)
             self.assertIn("SELKIES_UI_SIDEBAR_SHOW_CLIPBOARD=false|locked", env)
+
+    def test_runtime_manager_baseimage_clipboard_is_hard_disabled_and_pids_bounded(self):
+        runtime_root = Path(__file__).resolve().parents[1]
+        dockerfile = (runtime_root / "Dockerfile").read_text(encoding="utf-8")
+        compose = (runtime_root / "docker-compose.yml").read_text(encoding="utf-8")
+
+        for setting in (
+            'SELKIES_CLIPBOARD_ENABLED="false|locked"',
+            'SELKIES_CLIPBOARD_IN_ENABLED="false|locked"',
+            'SELKIES_CLIPBOARD_OUT_ENABLED="false|locked"',
+            'SELKIES_ENABLE_BINARY_CLIPBOARD="false|locked"',
+            'SELKIES_UI_SIDEBAR_SHOW_CLIPBOARD="false|locked"',
+        ):
+            self.assertIn(setting, dockerfile)
+
+        for setting in (
+            "SELKIES_CLIPBOARD_ENABLED=false|locked",
+            "SELKIES_CLIPBOARD_IN_ENABLED=false|locked",
+            "SELKIES_CLIPBOARD_OUT_ENABLED=false|locked",
+            "SELKIES_ENABLE_BINARY_CLIPBOARD=false|locked",
+            "SELKIES_UI_SIDEBAR_SHOW_CLIPBOARD=false|locked",
+        ):
+            self.assertIn(setting, compose)
+        self.assertIn("pids_limit: 200", compose)
 
     def test_companion_pids_limit_and_resource_caps_override(self):
         account = {"id": "beta", "display_name": "Beta", "runtime_provider": "agent_wechat"}
@@ -1436,6 +1464,46 @@ class RuntimeRegistryTests(unittest.TestCase):
         self.assertEqual(host["PidsLimit"], 50)
         self.assertEqual(host["Memory"], 512 * 1024 * 1024)
         self.assertEqual(host["NanoCpus"], 1500000000)
+
+    def test_safety_resource_overrides_cannot_disable_or_unbound_limits(self):
+        account = {"id": "bounded", "display_name": "Bounded", "runtime_provider": "agent_wechat"}
+        manager = agent_wechat_runtime.AgentWechatManager(engine=object())
+
+        with patch.dict(
+            os.environ,
+            {
+                "WECHAT_SELKIES_PIDS_LIMIT": "-1",
+                "WECHAT_SELKIES_MEM_LIMIT_MB": "0",
+                "WECHAT_SELKIES_CPU_LIMIT_CORES": "999",
+                "AGENT_WECHAT_PIDS_LIMIT": "9999999",
+                "AGENT_WECHAT_MEM_LIMIT_MB": "0",
+            },
+            clear=False,
+        ), patch.object(manager, "selkies_image_for", return_value="sha256:img"):
+            companion = manager._selkies_payload(
+                account,
+                parent_container_id="agent-bounded-id",
+                x11_volume="bounded-x11",
+                browser_files_volume="bounded-files",
+                host_desktop_token="/host/token",
+            )
+            primary = manager._container_payload(
+                account,
+                network="hub-net",
+                data_volume="bounded-data",
+                home_volume="bounded-home",
+                host_token="/host/auth-token",
+            )
+
+        companion_host = companion["HostConfig"]
+        primary_host = primary["HostConfig"]
+        # Non-positive values fall back to safe defaults rather than Docker's
+        # unlimited semantics. Excessively high overrides are clamped.
+        self.assertEqual(companion_host["PidsLimit"], 100)
+        self.assertEqual(companion_host["Memory"], 1024 * 1024 * 1024)
+        self.assertEqual(companion_host["NanoCpus"], 4000000000)
+        self.assertEqual(primary_host["PidsLimit"], 1024)
+        self.assertEqual(primary_host["Memory"], 2048 * 1024 * 1024)
 
     def test_desktop_session_release_cleans_up_companion_container(self):
         import unittest.mock

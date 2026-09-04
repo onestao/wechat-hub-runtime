@@ -58,8 +58,37 @@ SELKIES_DESKTOP_FEATURES = {
 
 
 def _selkies_clipboard_enabled() -> bool:
-    val = os.environ.get("WECHAT_SELKIES_CLIPBOARD_ENABLED", "false").strip().lower()
-    return val in {"1", "true", "yes", "on"}
+    """rc.2 safety policy: clipboard cannot be re-enabled by configuration.
+
+    HTTPS is necessary for browser Clipboard APIs, but it does not make the
+    upstream X11/xclip subprocess path safe.  Re-introducing clipboard requires
+    a separately audited backend/reaper and a new release gate.
+    """
+    return False
+
+
+def _bounded_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    """Read a safety-sensitive integer without allowing limits to be disabled."""
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if value <= 0:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _bounded_float_env(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    """Read a safety-sensitive float and clamp it to a finite safe range."""
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if not (value == value and value not in {float("inf"), float("-inf")}):
+        value = default
+    if value <= 0.0:
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 def selkies_desktop_features() -> dict[str, bool]:
@@ -88,7 +117,7 @@ NOVNC_DESKTOP_FEATURES = {
 # The existing X server remains the one and only desktop/WeChat session for the
 # account.
 SELKIES_ATTACH_COMMAND = [
-    "/bin/sh",
+    "/bin/bash",
     "-c",
     """set -eu
 export DISPLAY=:99
@@ -110,13 +139,23 @@ done
 command -v selkies >/dev/null 2>&1 || { echo 'selkies attach: selkies executable unavailable' >&2; exit 4; }
 env -u LD_PRELOAD selkies --addr=127.0.0.1 --port=8082 --mode=websockets --enable-https=false --enable-basic-auth=false --encoder=h264enc --enable-resize=true >/tmp/wechat-hub-selkies.log 2>&1 &
 selkies_pid=$!
+python3 /scripts/wechat/selkies_attach_gateway.py &
+proxy_pid=$!
 cleanup() {
+  trap - EXIT INT TERM
+  kill "$proxy_pid" 2>/dev/null || true
   kill "$selkies_pid" 2>/dev/null || true
   pkill -P "$selkies_pid" 2>/dev/null || true
-  pkill -u wechat xclip 2>/dev/null || true
+  wait "$proxy_pid" 2>/dev/null || true
+  wait "$selkies_pid" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
-exec python3 /scripts/wechat/selkies_attach_gateway.py
+set +e
+wait -n "$selkies_pid" "$proxy_pid"
+status=$?
+set -e
+cleanup
+exit "$status"
 """,
 ]
 
@@ -779,9 +818,15 @@ class AgentWechatManager:
         labels = self._desktop_labels(account, parent_container_id)
         env = list(_selkies_attach_env())
         env.append(f"WECHAT_ACCOUNT_ID={account['id']}")
-        pids_limit = int(os.environ.get("WECHAT_SELKIES_PIDS_LIMIT", "100"))
-        mem_limit_mb = int(os.environ.get("WECHAT_SELKIES_MEM_LIMIT_MB", "1024"))
-        cpu_cores = float(os.environ.get("WECHAT_SELKIES_CPU_LIMIT_CORES", "2.0"))
+        pids_limit = _bounded_int_env(
+            "WECHAT_SELKIES_PIDS_LIMIT", 100, minimum=32, maximum=512
+        )
+        mem_limit_mb = _bounded_int_env(
+            "WECHAT_SELKIES_MEM_LIMIT_MB", 1024, minimum=256, maximum=4096
+        )
+        cpu_cores = _bounded_float_env(
+            "WECHAT_SELKIES_CPU_LIMIT_CORES", 2.0, minimum=0.25, maximum=4.0
+        )
 
         host_config: dict[str, Any] = {
             "Mounts": [
@@ -800,6 +845,10 @@ class AgentWechatManager:
             # primary network namespace. PID/files remain isolated.
             "IpcMode": f"container:{parent_container_id}",
             "NetworkMode": f"container:{parent_container_id}",
+            # Docker's tiny init remains PID 1 and reaps orphaned/zombie
+            # helpers while forwarding termination to the Bash lifecycle
+            # supervisor below.
+            "Init": True,
             "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
             "PidsLimit": pids_limit,
             "Memory": mem_limit_mb * 1024 * 1024,
@@ -810,7 +859,7 @@ class AgentWechatManager:
             host_config["Devices"] = devices
         return {
             "Image": self.selkies_image_for(),
-            "Entrypoint": ["/bin/sh", "-c"],
+            "Entrypoint": SELKIES_ATTACH_COMMAND[:2],
             "Cmd": [SELKIES_ATTACH_COMMAND[2]],
             "User": "0:0",
             "WorkingDir": "/config",
@@ -978,8 +1027,14 @@ class AgentWechatManager:
                 # the shared internal WeChat Hub Docker network.
                 "NetworkMode": network,
                 "ShmSize": shm_size,
-                "PidsLimit": int(os.environ.get("AGENT_WECHAT_PIDS_LIMIT", "256")),
-                "Memory": int(os.environ.get("AGENT_WECHAT_MEM_LIMIT_MB", "2048")) * 1024 * 1024,
+                "PidsLimit": _bounded_int_env(
+                    "AGENT_WECHAT_PIDS_LIMIT", 256, minimum=64, maximum=1024
+                ),
+                "Memory": _bounded_int_env(
+                    "AGENT_WECHAT_MEM_LIMIT_MB", 2048, minimum=512, maximum=8192
+                )
+                * 1024
+                * 1024,
             },
             "NetworkingConfig": {"EndpointsConfig": {network: {"Aliases": [name]}}},
         }

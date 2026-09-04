@@ -135,6 +135,17 @@ ENV WECHAT_DESKTOP_GATEWAY_PUBLIC_PORT=""
 ENV WECHAT_SELKIES_ATTACH_ENABLED="true"
 ENV WECHAT_SELKIES_ATTACH_IMAGE=""
 
+# P0 host-stability boundary: this image is itself based on
+# linuxserver/baseimage-selkies.  Its built-in desktop service defaults
+# clipboard synchronization to enabled, independently of the on-demand
+# AgentWechat Selkies companion.  Keep the Runtime Manager's own Selkies
+# clipboard path hard-disabled so an xclip polling leak cannot recur here.
+ENV SELKIES_CLIPBOARD_ENABLED="false|locked"
+ENV SELKIES_CLIPBOARD_IN_ENABLED="false|locked"
+ENV SELKIES_CLIPBOARD_OUT_ENABLED="false|locked"
+ENV SELKIES_ENABLE_BINARY_CLIPBOARD="false|locked"
+ENV SELKIES_UI_SIDEBAR_SHOW_CLIPBOARD="false|locked"
+
 
 
 # update favicon
