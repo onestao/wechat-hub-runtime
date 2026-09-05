@@ -73,10 +73,19 @@ jobs:
             release_tag="${release_tag#v}"
           fi
           target="${REGISTRY}/${IMAGE_NAME}:${release_tag}"
-          if docker buildx imagetools inspect "$target" >/dev/null 2>&1; then
+          inspect_log="$(mktemp)"
+          if docker buildx imagetools inspect "$target" >"$inspect_log" 2>&1; then
             echo "Refusing to overwrite existing immutable release tag: $target" >&2
             exit 1
           fi
+          # Fail closed: only a definitive manifest-unknown/404 proves the tag is
+          # absent; auth, network, or unknown registry errors must not publish.
+          if ! grep -Eqi 'manifest unknown|not found|no such|404' "$inspect_log"; then
+            echo "Tag-absence check errored for $target; refusing to treat it as absent" >&2
+            cat "$inspect_log" >&2
+            exit 1
+          fi
+          rm -f "$inspect_log"
           echo "Release tag is unused: $target"
 
       - name: Extract metadata
