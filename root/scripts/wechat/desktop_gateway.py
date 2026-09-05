@@ -64,6 +64,20 @@ REQUEST_HEADER_BLOCKLIST = HOP_BY_HOP_HEADERS | {
     "sec-websocket-version",
 }
 RESPONSE_HEADER_BLOCKLIST = HOP_BY_HOP_HEADERS | {"set-cookie", "www-authenticate"}
+SELKIES_WEB_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript",
+    ".mjs": "text/javascript",
+    ".css": "text/css",
+    ".json": "application/json",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".wasm": "application/wasm",
+}
+# The base image keeps shared branding assets next to the dashboard bundle,
+# not inside it, so the Gateway falls back to that directory for them.
+SELKIES_WEB_FALLBACK_FILES = ("icon.png", "favicon.ico")
 
 
 class GatewaySessionError(RuntimeError):
@@ -317,6 +331,97 @@ def selkies_upstream_url(account: dict[str, Any], tail: str, query: Any) -> str:
 def desktop_provider(descriptor: dict[str, Any]) -> str:
     provider = str(descriptor.get("desktop_provider") or "novnc").strip().lower()
     return "selkies" if provider == "selkies" else "novnc"
+
+
+def selkies_web_root() -> Path:
+    """Filesystem root of the Selkies browser client bundled in the Runtime image."""
+
+    return Path(
+        os.environ.get("WECHAT_SELKIES_WEB_ROOT", "/usr/share/selkies/selkies-dashboard")
+    )
+
+
+def selkies_web_fallback_root() -> Path:
+    return Path(
+        os.environ.get("WECHAT_SELKIES_WEB_FALLBACK_ROOT", "/usr/share/selkies/www")
+    )
+
+
+def _safe_web_file(root: Path, relative: str) -> Path | None:
+    """Resolve ``relative`` below ``root`` and fail closed on any escape.
+
+    Component checks, canonical resolution, and a strict containment check
+    must all agree before a file is handed to the browser. A symlink inside
+    the web root that resolves outside it is rejected like a ``..`` escape.
+    """
+
+    parts = Path(relative).parts
+    if not parts or any(part in {"..", ""} for part in parts):
+        return None
+    try:
+        resolved_root = root.resolve()
+        candidate = (root / relative).resolve()
+    except OSError:
+        return None
+    if resolved_root not in candidate.parents:
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
+
+
+def resolve_selkies_web_file(tail: str) -> Path | None:
+    """Resolve a browser tail to the bundled Selkies web client.
+
+    The raw Selkies companion answers plain HTTP with 426 Upgrade Required,
+    so the navigable client (HTML/JS/CSS) has to come from this Gateway. Any
+    tail that does not resolve to a bundled file returns None and falls
+    through to the upstream proxy path.
+    """
+
+    root = selkies_web_root()
+    if not root.is_dir():
+        return None
+    relative = tail.strip("/")
+    if not relative:
+        relative = "index.html"
+    candidate = _safe_web_file(root, relative)
+    if candidate is not None:
+        return candidate
+    if relative in SELKIES_WEB_FALLBACK_FILES:
+        return _safe_web_file(selkies_web_fallback_root(), relative)
+    return None
+
+
+def selkies_web_content_type(path: Path) -> str | None:
+    return SELKIES_WEB_CONTENT_TYPES.get(path.suffix.lower())
+
+
+async def serve_selkies_web_file(path: Path) -> Any:
+    assert web is not None
+    headers = {
+        "Cache-Control": "no-store, max-age=0",
+        "Pragma": "no-cache",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+    }
+    content_type = selkies_web_content_type(path)
+    if content_type:
+        headers["Content-Type"] = content_type
+    return web.FileResponse(path, headers=headers)
+
+
+def selkies_web_manifest_response(tail: str) -> Any:
+    """Serve the PWA manifest that the nginx-based stack normally generates."""
+
+    assert web is not None
+    if tail.strip("/") != "manifest.json":
+        return None
+    title = os.environ.get("WECHAT_SELKIES_UI_TITLE", "微信桌面").strip() or "微信桌面"
+    return web.json_response(
+        {"name": title, "short_name": title, "display": "fullscreen", "start_url": "./"},
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 def proxy_upstream_url(
@@ -580,7 +685,40 @@ async def desktop_handler(request: Any) -> Any:
         raise web.HTTPNotFound(text="Desktop session is unavailable")
     if str(request.headers.get("Upgrade") or "").lower() == "websocket":
         return await proxy_websocket(request, descriptor, session_id, account, tail)
+    if desktop_provider(descriptor) == "selkies" and str(request.method).upper() == "GET":
+        local_file = resolve_selkies_web_file(tail)
+        if local_file is not None:
+            return await serve_selkies_web_file(local_file)
+        if not tail.strip("/"):
+            # The landing page must always be navigable HTML. The raw Selkies
+            # companion only answers plain HTTP with 426 Upgrade Required, so
+            # a missing client bundle is a Runtime packaging failure, not
+            # something the upstream can serve.
+            raise web.HTTPServiceUnavailable(
+                text="WeChat Hub desktop client is unavailable in this Runtime image",
+                headers={"Cache-Control": "no-store"},
+            )
+        manifest = selkies_web_manifest_response(tail)
+        if manifest is not None:
+            return manifest
     return await proxy_http(request, descriptor, session_id, account, tail)
+
+
+async def desktop_session_redirect(request: Any) -> Any:
+    """Normalize ``/desktop/<session>`` to the client's trailing-slash path."""
+
+    assert web is not None
+    session_id = str(request.match_info.get("session") or "")
+    location = f"/desktop/{session_id}/"
+    # Reflect nothing credential-shaped back into a browser-visible redirect.
+    query = [
+        (str(key), str(value))
+        for key, value in request.query.items()
+        if str(key).lower() != "token"
+    ]
+    if query:
+        location += "?" + urllib.parse.urlencode(query)
+    raise web.HTTPFound(location)
 
 
 async def health_handler(_request: Any) -> Any:
@@ -593,6 +731,7 @@ def create_app() -> Any:
         raise RuntimeError("aiohttp is required for WeChat Desktop Gateway")
     app = web.Application(client_max_size=http_request_limit())
     app.router.add_get("/healthz", health_handler)
+    app.router.add_get("/desktop/{session}", desktop_session_redirect)
     app.router.add_route("*", "/desktop/{session}/{tail:.*}", desktop_handler)
     return app
 

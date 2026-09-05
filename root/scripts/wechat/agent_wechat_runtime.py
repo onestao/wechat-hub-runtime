@@ -54,7 +54,10 @@ SELKIES_DESKTOP_FEATURES = {
     "clipboard_text": False,
     "clipboard_image": False,
     "file_upload": True,
-    "file_download": True,
+    # Uploads ride the WebSocket into the account browser-files volume, but
+    # downloads need the nginx /files route that the raw attach companion
+    # deliberately does not run. Advertise what is really reachable.
+    "file_download": False,
     "dynamic_resize": True,
     "dpi_scaling": True,
 }

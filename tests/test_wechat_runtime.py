@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from unittest.mock import patch
@@ -2400,6 +2401,302 @@ class RuntimeRegistryTests(unittest.TestCase):
             self.assertNotEqual(engine.exec_identifier, manager.container_name(account))
             self.assertNotEqual(engine.exec_identifier, renamed_name)
             self.assertEqual(result["credentials"][0]["account_dir"], "wx_renamed")
+
+    def test_selkies_desktop_features_do_not_claim_unreachable_download(self):
+        # Selkies file downloads ride the nginx /files route, which the raw
+        # attach companion does not run. The capability descriptor must not
+        # advertise a download channel the browser can never reach.
+        self.assertFalse(agent_wechat_runtime.selkies_desktop_features()["file_download"])
+        self.assertTrue(agent_wechat_runtime.selkies_desktop_features()["file_upload"])
+
+
+try:
+    import aiohttp
+    from aiohttp import web as aio_web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    AIOHTTP_AVAILABLE = True
+except ImportError:  # pragma: no cover - production test image installs aiohttp
+    AIOHTTP_AVAILABLE = False
+
+SELKIES_WEB_TESTS = unittest.skipUnless(
+    AIOHTTP_AVAILABLE, "aiohttp is required for Desktop Gateway HTTP tests"
+)
+
+
+@SELKIES_WEB_TESTS
+class DesktopGatewaySelkiesWebClientTests(unittest.IsolatedAsyncioTestCase):
+    """The /desktop/<session>/ route must be a navigable web client.
+
+    The raw Selkies companion answers plain HTTP with 426 Upgrade Required,
+    so the Gateway itself serves the client bundle it ships inside the
+    Runtime image and keeps browser-facing responses free of upstream
+    credentials.
+    """
+
+    def setUp(self):
+        self._env_patcher = None
+
+    def tearDown(self):
+        if self._env_patcher is not None:
+            self._env_patcher.stop()
+            self._env_patcher = None
+
+    def _patch_env(self, web_root: Path | None, fallback_root: Path | None = None):
+        env: dict[str, str] = {"WECHAT_GUI_LEASE_DIR": str(self._temp_root / "leases")}
+        if web_root is not None:
+            env["WECHAT_SELKIES_WEB_ROOT"] = str(web_root)
+        if fallback_root is not None:
+            env["WECHAT_SELKIES_WEB_FALLBACK_ROOT"] = str(fallback_root)
+        self._env_patcher = patch.dict(os.environ, env, clear=False)
+        self._env_patcher.start()
+
+    def setUp_web_roots(self, *, with_index: bool = True):
+        self._temp_root_obj = tempfile.TemporaryDirectory()
+        self._temp_root = Path(self._temp_root_obj.name)
+        self.addCleanup(self._temp_root_obj.cleanup)
+        web_root = self._temp_root / "selkies-dashboard"
+        web_root.mkdir(parents=True, exist_ok=True)
+        if with_index:
+            (web_root / "index.html").write_text(
+                "<!doctype html><html><body data-marker='wechat-hub-selkies'>"
+                "<script type='module' src='src/main.js'></script>"
+                "</body></html>",
+                encoding="utf-8",
+            )
+            (web_root / "src").mkdir(exist_ok=True)
+            (web_root / "src" / "main.js").write_text(
+                "// wechat-hub-selkies-main\n", encoding="utf-8"
+            )
+            (web_root / "assets").mkdir(exist_ok=True)
+            (web_root / "assets" / "style.css").write_text(
+                "body{background:#111}\n", encoding="utf-8"
+            )
+        return web_root
+
+    def _descriptor(self) -> dict:
+        return {
+            "account_id": "alpha",
+            "desktop_provider": "selkies",
+            "expires_at": int(time.time()) + 600,
+        }
+
+    def _account(self) -> dict:
+        return {"id": "alpha", "display_name": "Alpha", "runtime_provider": "agent_wechat"}
+
+    def _patch_session(self, *, unavailable: str | None = None):
+        if unavailable:
+            def _raise(_session_id):
+                raise desktop_gateway.GatewaySessionError(unavailable)
+
+            patcher = patch.object(desktop_gateway, "load_session", side_effect=_raise)
+        else:
+            patcher = patch.object(
+                desktop_gateway,
+                "load_session",
+                return_value=(self._descriptor(), self._account()),
+            )
+        return patcher
+
+    def _client(self) -> TestClient:
+        # The caller enters the client as an async context, which starts and
+        # stops the underlying server.
+        return TestClient(TestServer(desktop_gateway.create_app()))
+
+    async def test_selkies_landing_serves_navigable_html_repeatedly(self):
+        web_root = self.setUp_web_roots()
+        self._patch_env(web_root)
+        with self._patch_session():
+            async with self._client() as client:
+                for _ in range(2):  # initial load and a manual reload
+                    response = await client.get("/desktop/opaque-session-1/")
+                    self.assertEqual(response.status, 200)
+                    self.assertTrue(response.headers["Content-Type"].startswith("text/html"))
+                    self.assertEqual(response.headers["Cache-Control"], "no-store, max-age=0")
+                    body = await response.text()
+                    self.assertIn("wechat-hub-selkies", body)
+
+    async def test_selkies_static_assets_are_served_with_safe_content_types(self):
+        web_root = self.setUp_web_roots()
+        self._patch_env(web_root)
+        with self._patch_session():
+            async with self._client() as client:
+                script = await client.get("/desktop/opaque-session-1/src/main.js")
+                self.assertEqual(script.status, 200)
+                self.assertEqual(script.headers["Content-Type"], "text/javascript")
+                self.assertEqual(script.headers["X-Content-Type-Options"], "nosniff")
+                self.assertIn("wechat-hub-selkies-main", await script.text())
+                stylesheet = await client.get("/desktop/opaque-session-1/assets/style.css")
+                self.assertEqual(stylesheet.status, 200)
+                self.assertEqual(stylesheet.headers["Content-Type"], "text/css")
+
+    async def test_selkies_manifest_and_branding_fallback_are_served(self):
+        web_root = self.setUp_web_roots()
+        fallback_root = self._temp_root / "www"
+        fallback_root.mkdir()
+        (fallback_root / "icon.png").write_bytes(b"\x89PNG-fake-icon")
+        self._patch_env(web_root, fallback_root)
+        with self._patch_session():
+            async with self._client() as client:
+                manifest = await client.get("/desktop/opaque-session-1/manifest.json")
+                self.assertEqual(manifest.status, 200)
+                payload = await manifest.json()
+                self.assertEqual(payload["name"], "微信桌面")
+                icon = await client.get("/desktop/opaque-session-1/icon.png")
+                self.assertEqual(icon.status, 200)
+                self.assertEqual(icon.headers["Content-Type"], "image/png")
+                self.assertEqual(await icon.read(), b"\x89PNG-fake-icon")
+
+    async def test_selkies_missing_bundle_returns_clean_error_not_upstream_426(self):
+        web_root = self.setUp_web_roots(with_index=False)
+        self._patch_env(web_root)
+        with self._patch_session():
+            async with self._client() as client:
+                response = await client.get("/desktop/opaque-session-1/")
+                self.assertEqual(response.status, 503)
+                self.assertNotEqual(response.status, 426)
+                self.assertIn("unavailable", await response.text())
+
+    async def test_selkies_unknown_and_expired_sessions_fail_clean(self):
+        web_root = self.setUp_web_roots()
+        self._patch_env(web_root)
+        for reason in ("desktop session not found", "desktop session expired"):
+            with self.subTest(reason=reason), self._patch_session(unavailable=reason):
+                async with self._client() as client:
+                    response = await client.get("/desktop/opaque-session-1/")
+                    self.assertEqual(response.status, 404)
+                    body = await response.text()
+                    self.assertNotIn("426", body)
+                    self.assertNotIn("d" * 64, body)
+
+    async def test_selkies_websocket_upgrade_proxies_text_and_binary_frames(self):
+        web_root = self.setUp_web_roots()
+        self._patch_env(web_root)
+
+        seen_query: dict = {}
+
+        async def echo(request):
+            websocket = aio_web.WebSocketResponse()
+            await websocket.prepare(request)
+            async for message in websocket:
+                if message.type == aiohttp.WSMsgType.TEXT:
+                    await websocket.send_str("echo:" + message.data)
+                elif message.type == aiohttp.WSMsgType.BINARY:
+                    await websocket.send_bytes(b"bin:" + message.data)
+            return websocket
+
+        upstream_app = aio_web.Application()
+        upstream_app.router.add_get("/websockets", echo)
+        async with TestServer(upstream_app) as upstream_server:
+            upstream_base = f"http://{upstream_server.host}:{upstream_server.port}"
+
+            def fake_upstream_url(_descriptor, _account, tail, query, *, websocket=False):
+                del websocket
+                seen_query.update({str(key): str(value) for key, value in query.items()})
+                return f"{upstream_base}/{tail}"
+
+            with self._patch_session(), patch.object(
+                desktop_gateway, "proxy_upstream_url", side_effect=fake_upstream_url
+            ), patch.object(
+                desktop_gateway, "proxy_upstream_headers", return_value={}
+            ), patch.object(
+                agent_wechat_runtime.AgentWechatManager,
+                "_desktop_token",
+                return_value="d" * 64,
+            ):
+                async with self._client() as client:
+                    websocket = await client.ws_connect("/desktop/opaque-session-1/websockets")
+                    await websocket.send_str("hello")
+                    echoed_text = await websocket.receive()
+                    self.assertEqual(echoed_text.data, "echo:hello")
+                    await websocket.send_bytes(b"\x01\x02\x03")
+                    echoed_binary = await websocket.receive()
+                    self.assertEqual(echoed_binary.data, b"bin:\x01\x02\x03")
+                    await websocket.close()
+        # The browser-facing WebSocket URL must not carry any credential.
+        self.assertNotIn("token", {key.lower() for key in seen_query})
+
+    async def test_selkies_browser_responses_never_leak_upstream_token(self):
+        web_root = self.setUp_web_roots()
+        self._patch_env(web_root)
+        token = "d" * 64
+        with self._patch_session(), patch.object(
+            agent_wechat_runtime.AgentWechatManager, "_desktop_token", return_value=token
+        ), patch.object(
+            agent_wechat_runtime.AgentWechatManager, "_token", return_value=token
+        ):
+            async with self._client() as client:
+                for path in (
+                    "/desktop/opaque-session-1/",
+                    "/desktop/opaque-session-1/src/main.js",
+                    "/desktop/opaque-session-1/manifest.json",
+                    "/desktop/opaque-session-1/icon.png",
+                    "/desktop/opaque-session-1/",
+                ):
+                    response = await client.get(path)
+                    body = await response.read()
+                    headers_blob = "\n".join(
+                        f"{key}: {value}" for key, value in response.headers.items()
+                    )
+                    self.assertNotIn(token, body.decode("utf-8", "replace"))
+                    self.assertNotIn(token, headers_blob)
+                redirect = await client.get("/desktop/opaque-session-1", allow_redirects=False)
+                self.assertEqual(redirect.status, 302)
+                self.assertNotIn(token, redirect.headers.get("Location") or "")
+
+    async def test_selkies_session_root_without_trailing_slash_redirects_to_client(self):
+        web_root = self.setUp_web_roots()
+        self._patch_env(web_root)
+        with self._patch_session():
+            async with self._client() as client:
+                response = await client.get(
+                    "/desktop/opaque-session-1?next=1&token=should-not-be-reflected",
+                    allow_redirects=False,
+                )
+                self.assertEqual(response.status, 302)
+                self.assertEqual(response.headers["Location"], "/desktop/opaque-session-1/?next=1")
+                self.assertNotIn("token=", response.headers["Location"])
+
+    async def test_selkies_web_resolver_is_fail_closed_against_escapes(self):
+        web_root = self.setUp_web_roots()
+        self._patch_env(web_root)
+        outside = self._temp_root / "outside-secret.txt"
+        outside.write_text("secret", encoding="utf-8")
+        link = web_root / "escape"
+        try:
+            link.symlink_to(outside)
+        except (OSError, NotImplementedError):
+            link = None  # Windows without symlink privilege: containment still holds.
+        self.assertIsNone(desktop_gateway.resolve_selkies_web_file("../../outside-secret.txt"))
+        self.assertIsNone(desktop_gateway.resolve_selkies_web_file("src/../../outside-secret.txt"))
+        self.assertIsNone(desktop_gateway.resolve_selkies_web_file("missing.js"))
+        if link is not None:
+            self.assertIsNone(desktop_gateway.resolve_selkies_web_file("escape"))
+        self.assertIsNone(
+            desktop_gateway._safe_web_file(web_root, "..")
+        )
+        resolved = desktop_gateway.resolve_selkies_web_file("src/main.js")
+        self.assertIsNotNone(resolved)
+        self.assertIn("selkies-dashboard", str(resolved))
+
+    async def test_novnc_sessions_are_not_served_from_selkies_web_root(self):
+        web_root = self.setUp_web_roots()
+        self._patch_env(web_root)
+        descriptor = self._descriptor()
+        descriptor["desktop_provider"] = "novnc"
+
+        async def fake_proxy_http(_request, _descriptor, _session_id, _account, tail):
+            return aio_web.Response(text=f"proxied:{tail}")
+
+        with patch.object(
+            desktop_gateway,
+            "load_session",
+            return_value=(descriptor, self._account()),
+        ), patch.object(desktop_gateway, "proxy_http", side_effect=fake_proxy_http):
+            async with self._client() as client:
+                response = await client.get("/desktop/opaque-session-1/")
+                self.assertEqual(response.status, 200)
+                self.assertEqual(await response.text(), "proxied:")
 
 
 if __name__ == "__main__":
