@@ -2418,6 +2418,11 @@ try:
     AIOHTTP_AVAILABLE = True
 except ImportError:  # pragma: no cover - production test image installs aiohttp
     AIOHTTP_AVAILABLE = False
+    # The class below is skipped without aiohttp, but its body still executes
+    # at import time; annotations must resolve to avoid a NameError on CI.
+    TestClient = None
+    TestServer = None
+    aio_web = None
 
 SELKIES_WEB_TESTS = unittest.skipUnless(
     AIOHTTP_AVAILABLE, "aiohttp is required for Desktop Gateway HTTP tests"
