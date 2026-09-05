@@ -141,6 +141,7 @@ class FakeDockerEngine:
 
     def exec_container(self, identifier, command, *, env=None, timeout=30.0, attach_stderr=True):
         del env, timeout, attach_stderr
+        self.exec_identifier = identifier
         resolved = self._resolve(identifier)
         if not resolved:
             raise RuntimeError("container not found")
@@ -316,7 +317,7 @@ class RuntimeRegistryTests(unittest.TestCase):
         self.assertTrue(any(item.get("Source") == "personal-data" and item.get("Target") == "/data" for item in mounts))
         self.assertTrue(any(item.get("Source") == "personal-home" and item.get("Target") == "/home/wechat" for item in mounts))
         self.assertTrue(any(item.get("Target") == "/data/auth-token" and item.get("ReadOnly") for item in mounts))
-        self.assertEqual(payload["HostConfig"]["PidsLimit"], 256)
+        self.assertEqual(payload["HostConfig"]["PidsLimit"], 512)
         self.assertEqual(payload["HostConfig"]["Memory"], 2048 * 1024 * 1024)
 
     def test_agent_health_distinguishes_container_server_and_login_state(self):
@@ -357,7 +358,11 @@ class RuntimeRegistryTests(unittest.TestCase):
                 "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
                 "Labels": agent_wechat_runtime._labels("alpha"),
             },
-            "HostConfig": {"NetworkMode": "hub-net"},
+            "HostConfig": {
+                "NetworkMode": "hub-net",
+                "PidsLimit": 512,
+                "Memory": 2048 * 1024 * 1024,
+            },
             "State": {"Running": True},
             "NetworkSettings": {"Ports": {}},
         }
@@ -627,6 +632,8 @@ class RuntimeRegistryTests(unittest.TestCase):
             },
             "HostConfig": {
                 "NetworkMode": "hub-net",
+                "PidsLimit": 512,
+                "Memory": 2048 * 1024 * 1024,
                 "Mounts": [
                     {"Type": "volume", "Source": "alpha-x11", "Target": "/tmp/.X11-unix"},
                     {
@@ -1004,11 +1011,30 @@ class RuntimeRegistryTests(unittest.TestCase):
         class ExecDockerEngine:
             def __init__(self, rows):
                 self.rows = rows
+                self.exec_identifier = None
 
             def inspect_container(self, identifier):
-                return {"State": {"Running": True}}
+                del identifier
+                return {
+                    "Id": "export-parent",
+                    "Name": "/renamed-managed-primary",
+                    "Config": {
+                        "Labels": {
+                            "com.wechat-hub.managed": "true",
+                            "com.wechat-hub.account-id": "personal",
+                            "com.wechat-hub.provider": "agent_wechat",
+                        }
+                    },
+                    "State": {"Running": True},
+                    "HostConfig": {"PidsLimit": 512, "Memory": 2048 * 1024 * 1024},
+                }
+
+            def managed_containers(self, account_id, *, provider="agent_wechat"):
+                del account_id, provider
+                return [{"Id": "export-parent"}]
 
             def exec_container(self, identifier, command, *, env=None, timeout=30.0, attach_stderr=True):
+                self.exec_identifier = identifier
                 self.command = command
                 self.env = env
                 self.attach_stderr = attach_stderr
@@ -1050,6 +1076,8 @@ class RuntimeRegistryTests(unittest.TestCase):
         self.assertEqual(result["credentials"][0]["account_dir"], "wxid_personal")
         self.assertEqual(result["credentials"][0]["db_name"], "session.db")
         self.assertEqual(result["credentials"][0]["hex_key"], "ab" * 32)
+        self.assertEqual(engine.exec_identifier, "export-parent")
+        self.assertNotEqual(engine.exec_identifier, manager.container_name(account))
 
     def test_agent_full_login_flow_keeps_qr_in_memory_and_reaches_login_success(self):
         account = {"id": "personal", "display_name": "Personal", "runtime_provider": "agent_wechat"}
@@ -1584,7 +1612,9 @@ class RuntimeRegistryTests(unittest.TestCase):
                         "Mounts": [
                             {"Target": "/tmp/.X11-unix"},
                             {"Target": "/home/wechat/WeChatHubFiles"},
-                        ]
+                        ],
+                        "PidsLimit": 512,
+                        "Memory": 2048 * 1024 * 1024,
                     },
                 },
             )["Id"]
@@ -1622,6 +1652,7 @@ class RuntimeRegistryTests(unittest.TestCase):
             "Id": "fake-degraded",
             "Name": "/wechat-agent-acc-degraded",
             "Config": {"Image": "ghcr.io/thisnick/agent-wechat:0.11.15"},
+            "HostConfig": {"PidsLimit": 512, "Memory": 2048 * 1024 * 1024},
             "State": {"Running": True},
             "NetworkSettings": {"Ports": {}},
         }
@@ -1649,6 +1680,726 @@ class RuntimeRegistryTests(unittest.TestCase):
                 self.assertNotIn("acc-churn", desktop_gateway._MANUAL_GUI_LEASES)
             self.assertEqual(len(desktop_gateway._IDLE_CLEANUP_TIMERS), 0)
             self.assertEqual(len(removed), 50)
+
+
+    def test_agent_primary_resource_limits_default_and_overrides(self):
+        account = {"id": "res-test", "display_name": "ResTest", "runtime_provider": "agent_wechat"}
+        manager = agent_wechat_runtime.AgentWechatManager(engine=object())
+
+        # 1. Default PidsLimit is 512
+        policy_default = manager._desired_primary_resource_policy(account)
+        self.assertEqual(policy_default["PidsLimit"], 512)
+        self.assertEqual(policy_default["Memory"], 2048 * 1024 * 1024)
+
+        # 2. Explicit valid overrides: 384, 512
+        with patch.dict(os.environ, {"AGENT_WECHAT_PIDS_LIMIT": "384"}, clear=False):
+            self.assertEqual(manager._desired_primary_resource_policy(account)["PidsLimit"], 384)
+        with patch.dict(os.environ, {"AGENT_WECHAT_PIDS_LIMIT": "512"}, clear=False):
+            self.assertEqual(manager._desired_primary_resource_policy(account)["PidsLimit"], 512)
+
+        # 3. Non-positive / invalid overrides fall back to safe default 512
+        with patch.dict(os.environ, {"AGENT_WECHAT_PIDS_LIMIT": "0"}, clear=False):
+            self.assertEqual(manager._desired_primary_resource_policy(account)["PidsLimit"], 512)
+        with patch.dict(os.environ, {"AGENT_WECHAT_PIDS_LIMIT": "-1"}, clear=False):
+            self.assertEqual(manager._desired_primary_resource_policy(account)["PidsLimit"], 512)
+        with patch.dict(os.environ, {"AGENT_WECHAT_PIDS_LIMIT": "invalid"}, clear=False):
+            self.assertEqual(manager._desired_primary_resource_policy(account)["PidsLimit"], 512)
+
+        # 4. Out-of-bound overrides are clamped
+        with patch.dict(os.environ, {"AGENT_WECHAT_PIDS_LIMIT": "9999999"}, clear=False):
+            self.assertEqual(manager._desired_primary_resource_policy(account)["PidsLimit"], 1024)
+        with patch.dict(os.environ, {"AGENT_WECHAT_PIDS_LIMIT": "10"}, clear=False):
+            self.assertEqual(manager._desired_primary_resource_policy(account)["PidsLimit"], 64)
+
+        # 5. Selkies companion default remains 100
+        companion_pids = agent_wechat_runtime._bounded_int_env(
+            "WECHAT_SELKIES_PIDS_LIMIT", 100, minimum=32, maximum=512
+        )
+        self.assertEqual(companion_pids, 100)
+
+    def test_existing_stopped_primary_with_pids_drift_is_recreated_preserving_volumes(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-drift", "display_name": "Drift", "runtime_provider": "agent_wechat"}
+
+        old_container_id = "fake-old-256"
+        engine.containers[old_container_id] = {
+            "Id": old_container_id,
+            "Name": "/wechat-agent-acc-drift",
+            "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+            "Config": {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-drift"),
+            },
+            "HostConfig": {
+                "PidsLimit": 256,
+                "Memory": 2048 * 1024 * 1024,
+                "Mounts": [
+                    {"Target": "/tmp/.X11-unix"},
+                    {"Target": "/home/wechat/WeChatHubFiles"},
+                ],
+            },
+            "State": {"Running": False},
+            "NetworkSettings": {"Ports": {}},
+        }
+
+        drift = manager._primary_resource_policy_drift(engine.containers[old_container_id], account)
+        self.assertIn("PidsLimit", drift)
+        self.assertEqual(drift["PidsLimit"], {"current": 256, "desired": 512})
+
+        with patch.object(
+            manager, "_host_config_root_and_network", return_value=("/host/root", "wechat-hub_net")
+        ), patch.object(
+            manager, "_ensure_volumes", return_value=("drift-data", "drift-home", "/host/token")
+        ), patch.object(
+            manager, "_ensure_desktop_volumes", return_value=("drift-x11", "drift-files")
+        ), patch.object(
+            manager, "_reset_x11_socket_dir"
+        ):
+            ensured = manager.ensure_container(account)
+
+        self.assertNotIn(old_container_id, engine.containers)
+        self.assertNotEqual(ensured["Id"], old_container_id)
+        self.assertEqual(ensured["HostConfig"]["PidsLimit"], 512)
+        self.assertEqual(ensured["HostConfig"]["Memory"], 2048 * 1024 * 1024)
+        mounts = ensured["HostConfig"]["Mounts"]
+        self.assertTrue(any(m.get("Source") == "drift-data" and m.get("Target") == "/data" for m in mounts))
+        self.assertTrue(any(m.get("Source") == "drift-home" and m.get("Target") == "/home/wechat" for m in mounts))
+        self.assertTrue(any(m.get("Target") == "/data/auth-token" and m.get("ReadOnly") for m in mounts))
+        self.assertTrue(any(m.get("Source") == "drift-x11" and m.get("Target") == "/tmp/.X11-unix" for m in mounts))
+        self.assertTrue(any(m.get("Source") == "drift-files" and m.get("Target") == "/home/wechat/WeChatHubFiles" for m in mounts))
+        self.assertEqual(ensured["Config"]["Labels"]["com.wechat-hub.account-id"], "acc-drift")
+        self.assertEqual(ensured["Config"]["Labels"]["com.wechat-hub.managed"], "true")
+        self.assertEqual(ensured["HostConfig"]["NetworkMode"], "wechat-hub_net")
+        self.assertFalse(any(op[0] == "remove_volume" for op in engine.operations))
+
+    def test_existing_stopped_primary_matching_policy_is_not_recreated(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-matched", "display_name": "Matched", "runtime_provider": "agent_wechat"}
+
+        container_id = "fake-matched-512"
+        engine.containers[container_id] = {
+            "Id": container_id,
+            "Name": "/wechat-agent-acc-matched",
+            "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+            "Config": {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-matched"),
+            },
+            "HostConfig": {
+                "PidsLimit": 512,
+                "Memory": 2048 * 1024 * 1024,
+                "Mounts": [
+                    {"Target": "/tmp/.X11-unix"},
+                    {"Target": "/home/wechat/WeChatHubFiles"},
+                ],
+            },
+            "State": {"Running": False},
+            "NetworkSettings": {"Ports": {}},
+        }
+
+        drift = manager._primary_resource_policy_drift(engine.containers[container_id], account)
+        self.assertEqual(drift, {})
+
+        with patch.object(
+            manager, "_host_config_root_and_network", return_value=("/host/root", "wechat-hub_net")
+        ), patch.object(
+            manager, "_ensure_volumes", return_value=("matched-data", "matched-home", "/host/token")
+        ), patch.object(
+            manager, "_ensure_desktop_volumes", return_value=("matched-x11", "matched-files")
+        ), patch.object(
+            manager, "_reset_x11_socket_dir"
+        ):
+            ensured = manager.ensure_container(account)
+
+        self.assertEqual(ensured["Id"], container_id)
+        self.assertFalse(any(op[0] == "remove_container" for op in engine.operations))
+        self.assertFalse(any(op[0] == "create_container" for op in engine.operations))
+
+    def test_existing_running_primary_with_drift_is_not_recreated_and_exposes_drift(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-running", "display_name": "Running", "runtime_provider": "agent_wechat"}
+
+        container_id = "fake-running-256"
+        engine.containers[container_id] = {
+            "Id": container_id,
+            "Name": "/wechat-agent-acc-running",
+            "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+            "Config": {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-running"),
+            },
+            "HostConfig": {
+                "PidsLimit": 256,
+                "Memory": 2048 * 1024 * 1024,
+                "Mounts": [
+                    {"Target": "/tmp/.X11-unix"},
+                    {"Target": "/home/wechat/WeChatHubFiles"},
+                ],
+            },
+            "State": {"Running": True},
+            "NetworkSettings": {"Ports": {}},
+        }
+
+        with patch.object(
+            manager, "_host_config_root_and_network", return_value=("/host/root", "wechat-hub_net")
+        ), patch.object(
+            manager, "_ensure_volumes", return_value=("run-data", "run-home", "/host/token")
+        ), patch.object(
+            manager, "_ensure_desktop_volumes", return_value=("run-x11", "run-files")
+        ):
+            ensured = manager.ensure_container(account)
+
+        self.assertEqual(ensured["Id"], container_id)
+        self.assertFalse(any(op[0] == "remove_container" for op in engine.operations))
+        self.assertFalse(any(op[0] == "create_container" for op in engine.operations))
+        self.assertEqual(ensured["HostConfig"]["PidsLimit"], 256)
+
+        status = manager._status_from_inspect(account, engine.containers[container_id])
+        self.assertTrue(status["running"])
+        self.assertIn("PidsLimit", status["resource_policy_drift"])
+        self.assertEqual(status["resource_policy_drift"]["PidsLimit"], {"current": 256, "desired": 512})
+        self.assertTrue(status["resource_reconcile_required"])
+
+    def test_controlled_restart_reconciles_running_primary_resource_drift(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-recon", "display_name": "Recon", "runtime_provider": "agent_wechat"}
+
+        container_id = "fake-recon-256"
+        engine.containers[container_id] = {
+            "Id": container_id,
+            "Name": "/wechat-agent-acc-recon",
+            "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+            "Config": {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-recon"),
+            },
+            "HostConfig": {
+                "PidsLimit": 256,
+                "Memory": 2048 * 1024 * 1024,
+                "Mounts": [
+                    {"Target": "/tmp/.X11-unix"},
+                    {"Target": "/home/wechat/WeChatHubFiles"},
+                ],
+            },
+            "State": {"Running": True},
+            "NetworkSettings": {"Ports": {}},
+        }
+
+        with patch.object(
+            manager, "_host_config_root_and_network", return_value=("/host/root", "wechat-hub_net")
+        ), patch.object(
+            manager, "_ensure_volumes", return_value=("recon-data", "recon-home", "/host/token")
+        ), patch.object(
+            manager, "_ensure_desktop_volumes", return_value=("recon-x11", "recon-files")
+        ), patch.object(
+            manager, "_reset_x11_socket_dir"
+        ), patch.object(
+            manager, "_probe_agent_server", return_value=(True, "")
+        ), patch.object(
+            manager, "_probe_wechat_login", return_value=("logged_in", "user1", "")
+        ), patch.object(
+            manager, "_persist_status", side_effect=lambda acc, st: st
+        ):
+            restarted = manager.restart(account)
+
+        self.assertEqual(restarted["action"], "restarted")
+        self.assertTrue(any(op[0] == "stop_container" for op in engine.operations))
+        self.assertTrue(any(op[0] == "remove_container" for op in engine.operations))
+        self.assertTrue(any(op[0] == "start_container" for op in engine.operations))
+        active = manager._find_container(account)
+        self.assertIsNotNone(active)
+        self.assertEqual(active["HostConfig"]["PidsLimit"], 512)
+        self.assertTrue(active["State"]["Running"])
+        self.assertFalse(any(op[0] == "remove_volume" for op in engine.operations))
+        self.assertTrue(any(op[0] == "exec_container" for op in engine.operations))
+        self.assertEqual(restarted["resource_policy_drift"], {})
+        self.assertFalse(restarted["resource_reconcile_required"])
+
+    def test_start_on_running_primary_with_drift_skips_desktop_exec_and_requires_reconcile(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-running-drift", "display_name": "RunningDrift", "runtime_provider": "agent_wechat"}
+
+        container_id = "fake-running-drift-256"
+        engine.containers[container_id] = {
+            "Id": container_id,
+            "Name": "/wechat-agent-acc-running-drift",
+            "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+            "Config": {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-running-drift"),
+            },
+            "HostConfig": {
+                "PidsLimit": 256,
+                "Memory": 2048 * 1024 * 1024,
+                "Mounts": [
+                    {"Target": "/tmp/.X11-unix"},
+                    {"Target": "/home/wechat/WeChatHubFiles"},
+                ],
+            },
+            "State": {"Running": True},
+            "NetworkSettings": {"Ports": {}},
+        }
+
+        with patch.object(
+            manager, "_host_config_root_and_network", return_value=("/host/root", "wechat-hub_net")
+        ), patch.object(
+            manager, "_ensure_volumes", return_value=("data", "home", "/host/token")
+        ), patch.object(
+            manager, "_ensure_desktop_volumes", return_value=("x11", "files")
+        ), patch.object(
+            manager, "_probe_agent_server", return_value=(True, "")
+        ), patch.object(
+            manager, "_probe_wechat_login", return_value=("logged_in", "user1", "")
+        ), patch.object(
+            manager, "_persist_status", side_effect=lambda acc, st: st
+        ):
+            engine.operations.clear()
+            result = manager.start(account)
+
+        # 1. Container ID is unchanged
+        self.assertEqual(result["container_id"], container_id)
+        active = engine.inspect_container(container_id)
+        self.assertIsNotNone(active)
+        # 2. PidsLimit remains 256
+        self.assertEqual(active["HostConfig"]["PidsLimit"], 256)
+        # 3. No container recreation or removal
+        self.assertEqual([op for op in engine.operations if op[0] == "remove_container"], [])
+        self.assertEqual([op for op in engine.operations if op[0] == "create_container"], [])
+        # 4. Strictly ZERO docker exec operations (CRITICAL P0/P1 assertion)
+        self.assertEqual([op for op in engine.operations if op[0] == "exec_container"], [])
+        # 5. Resource drift exposed
+        self.assertEqual(result["resource_policy_drift"], {"PidsLimit": {"current": 256, "desired": 512}})
+        # 6. Status clearly indicates reconcile required and running drift action
+        self.assertTrue(result["resource_reconcile_required"])
+        self.assertEqual(result["action"], "running-resource-drift")
+        self.assertNotIn("interactive_desktop", result)
+
+    def test_start_on_running_primary_without_drift_reconciles_desktop_normally(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-running-nodrift", "display_name": "RunningNoDrift", "runtime_provider": "agent_wechat"}
+
+        container_id = "fake-running-nodrift-512"
+        engine.containers[container_id] = {
+            "Id": container_id,
+            "Name": "/wechat-agent-acc-running-nodrift",
+            "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+            "Config": {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-running-nodrift"),
+            },
+            "HostConfig": {
+                "PidsLimit": 512,
+                "Memory": 2048 * 1024 * 1024,
+                "Mounts": [
+                    {"Target": "/tmp/.X11-unix"},
+                    {"Target": "/home/wechat/WeChatHubFiles"},
+                ],
+            },
+            "State": {"Running": True},
+            "NetworkSettings": {"Ports": {}},
+        }
+
+        with patch.object(
+            manager, "_host_config_root_and_network", return_value=("/host/root", "wechat-hub_net")
+        ), patch.object(
+            manager, "_ensure_volumes", return_value=("data", "home", "/host/token")
+        ), patch.object(
+            manager, "_ensure_desktop_volumes", return_value=("x11", "files")
+        ), patch.object(
+            manager, "_probe_agent_server", return_value=(True, "")
+        ), patch.object(
+            manager, "_probe_wechat_login", return_value=("logged_in", "user1", "")
+        ), patch.object(
+            manager, "_persist_status", side_effect=lambda acc, st: st
+        ):
+            engine.operations.clear()
+            result = manager.start(account)
+
+        # 1. Container ID unchanged
+        self.assertEqual(result["container_id"], container_id)
+        # 2. No remove or create
+        self.assertEqual([op for op in engine.operations if op[0] == "remove_container"], [])
+        self.assertEqual([op for op in engine.operations if op[0] == "create_container"], [])
+        # 3. Interactive desktop exec executes normally!
+        exec_ops = [op for op in engine.operations if op[0] == "exec_container"]
+        self.assertEqual(len(exec_ops), 1)
+        self.assertEqual(exec_ops[0][1], container_id)
+        # 4. No drift
+        self.assertEqual(result["resource_policy_drift"], {})
+        self.assertFalse(result["resource_reconcile_required"])
+        self.assertEqual(result["action"], "started")
+        self.assertTrue(result["interactive_desktop"]["interactive"])
+
+
+    def test_status_running_resource_drift_is_quarantined_without_app_probes(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-quarantine", "display_name": "Quarantine", "runtime_provider": "agent_wechat"}
+        container_id = "fake-quarantine-256"
+        engine.containers[container_id] = {
+            "Id": container_id,
+            "Name": "/wechat-agent-acc-quarantine",
+            "Config": {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-quarantine"),
+            },
+            "HostConfig": {"PidsLimit": 256, "Memory": 2048 * 1024 * 1024},
+            "State": {"Running": True},
+            "NetworkSettings": {"Ports": {}},
+        }
+        with patch.object(
+            manager, "_persist_status", side_effect=lambda acc, status: status
+        ), patch.object(
+            manager,
+            "_probe_agent_server",
+            side_effect=AssertionError("resource-drift status must not probe /health"),
+        ), patch.object(
+            manager,
+            "_probe_wechat_login",
+            side_effect=AssertionError("resource-drift status must not probe auth API"),
+        ):
+            status = manager.status(account)
+
+        self.assertTrue(status["running"])
+        self.assertEqual(status["runtime_health"], "degraded")
+        self.assertIsNone(status["agent_server_healthy"])
+        self.assertEqual(status["wechat_login_status"], "quarantined-resource-drift")
+        self.assertIn("controlled restart required", status["health_error"])
+        self.assertEqual(
+            status["resource_policy_drift"],
+            {"PidsLimit": {"current": 256, "desired": 512}},
+        )
+        self.assertTrue(status["resource_reconcile_required"])
+
+    def test_api_request_running_resource_drift_does_not_call_upstream_api(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-api-drift", "display_name": "ApiDrift", "runtime_provider": "agent_wechat"}
+        container_id = "fake-api-drift-256"
+        engine.containers[container_id] = {
+            "Id": container_id,
+            "Name": "/wechat-agent-acc-api-drift",
+            "Config": {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-api-drift"),
+            },
+            "HostConfig": {"PidsLimit": 256, "Memory": 2048 * 1024 * 1024},
+            "State": {"Running": True},
+            "NetworkSettings": {"Ports": {}},
+        }
+        with patch.object(
+            manager, "_persist_status", side_effect=lambda acc, status: status
+        ), patch.object(
+            manager,
+            "_request_json_direct",
+            side_effect=AssertionError("quarantined account must not receive an upstream API request"),
+        ):
+            with self.assertRaisesRegex(agent_wechat_runtime.AgentWechatRuntimeError, "controlled restart required"):
+                manager.api_request(account, "GET", "/api/status/auth")
+        self.assertEqual([item for item in engine.operations if item[0] == "exec_container"], [])
+
+    def test_desktop_running_resource_drift_does_not_exec_or_create_selkies(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-desktop-drift", "display_name": "DesktopDrift", "runtime_provider": "agent_wechat"}
+        container_id = "fake-desktop-drift-256"
+        engine.containers[container_id] = {
+            "Id": container_id,
+            "Name": "/wechat-agent-acc-desktop-drift",
+            "Config": {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-desktop-drift"),
+            },
+            "HostConfig": {"PidsLimit": 256, "Memory": 2048 * 1024 * 1024},
+            "State": {"Running": True},
+            "NetworkSettings": {"Ports": {}},
+        }
+        with patch.object(
+            manager, "_persist_status", side_effect=lambda acc, status: status
+        ):
+            with self.assertRaisesRegex(agent_wechat_runtime.AgentWechatRuntimeError, "controlled restart required"):
+                manager.desktop(account, desktop_provider="novnc")
+            with self.assertRaisesRegex(agent_wechat_runtime.AgentWechatRuntimeError, "controlled restart required"):
+                manager.desktop(account, desktop_provider="auto")
+
+        self.assertEqual([item for item in engine.operations if item[0] == "exec_container"], [])
+        self.assertEqual([item for item in engine.operations if item[0] == "create_container"], [])
+        self.assertFalse(manager._find_desktop_container(account))
+
+    def test_export_db_keys_running_resource_drift_does_not_exec(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-export-drift", "display_name": "ExportDrift", "runtime_provider": "agent_wechat"}
+        container_id = "fake-export-drift-256"
+        engine.containers[container_id] = {
+            "Id": container_id,
+            "Name": "/" + agent_wechat_runtime.AgentWechatManager.container_name(account),
+            "Config": {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-export-drift"),
+            },
+            "HostConfig": {"PidsLimit": 256, "Memory": 2048 * 1024 * 1024},
+            "State": {"Running": True},
+            "NetworkSettings": {"Ports": {}},
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "data").mkdir()
+            (root / "data" / "agent.db").write_bytes(b"sqlite")
+            with patch.object(manager, "runtime_storage_root", return_value=root), patch.object(
+                manager, "_token", return_value="a" * 64
+            ):
+                with self.assertRaisesRegex(agent_wechat_runtime.AgentWechatRuntimeError, "controlled restart required"):
+                    manager.export_db_keys(account)
+
+        self.assertEqual([item for item in engine.operations if item[0] == "exec_container"], [])
+
+    def test_start_login_running_resource_drift_does_not_start_thread(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-login-drift", "display_name": "LoginDrift", "runtime_provider": "agent_wechat"}
+        container_id = "fake-login-drift-256"
+        engine.containers[container_id] = {
+            "Id": container_id,
+            "Name": "/wechat-agent-acc-login-drift",
+            "Config": {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-login-drift"),
+            },
+            "HostConfig": {"PidsLimit": 256, "Memory": 2048 * 1024 * 1024},
+            "State": {"Running": True},
+            "NetworkSettings": {"Ports": {}},
+        }
+        try:
+            with patch.object(
+                manager, "_persist_status", side_effect=lambda acc, status: status
+            ), patch.object(
+                manager,
+                "_ensure_login_flow",
+                side_effect=AssertionError("quarantined account must not start a login thread"),
+            ):
+                with self.assertRaisesRegex(agent_wechat_runtime.AgentWechatRuntimeError, "controlled restart required"):
+                    manager.start_login(account)
+            self.assertEqual(manager._login_flow_snapshot("acc-login-drift"), {})
+            self.assertEqual([item for item in engine.operations if item[0] == "exec_container"], [])
+        finally:
+            with agent_wechat_runtime._LOGIN_FLOWS_LOCK:
+                agent_wechat_runtime._LOGIN_FLOWS.pop("acc-login-drift", None)
+
+    def test_running_no_drift_512_functions_remain_available(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-healthy-512", "display_name": "Healthy512", "runtime_provider": "agent_wechat"}
+        container_id = "fake-healthy-512"
+        engine.containers[container_id] = {
+            "Id": container_id,
+            "Name": "/" + agent_wechat_runtime.AgentWechatManager.container_name(account),
+            "Config": {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-healthy-512"),
+            },
+            "HostConfig": {"PidsLimit": 512, "Memory": 2048 * 1024 * 1024},
+            "State": {"Running": True},
+            "NetworkSettings": {"Ports": {}},
+        }
+
+        def export_exec(identifier, command, *, env=None, timeout=30.0, attach_stderr=True):
+            del identifier, env, timeout, attach_stderr
+            engine.operations.append(("exec_container", container_id, list(command)))
+            if any("sqlcipher" in str(part) for part in command):
+                rows = [{"account_dir": "wxid_healthy", "db_name": "session.db", "hex_key": "ab" * 32, "verified_at": ""}]
+                return 0, b"ok\n" + json.dumps(rows).encode("utf-8")
+            return 0, b"state=restarted\n"
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"WECHAT_DESKTOP_GATEWAY_SESSION_DIR": temp}, clear=False
+        ):
+            root = Path(temp)
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "agent.db").write_bytes(b"sqlite")
+            with patch.object(
+                manager, "runtime_storage_root", return_value=root
+            ), patch.object(manager, "_token", return_value="a" * 64), patch.object(
+                manager, "_persist_status", side_effect=lambda acc, status: status
+            ), patch.object(
+                manager, "_probe_agent_server", return_value=(True, "")
+            ), patch.object(
+                manager, "_probe_wechat_login", return_value=("logged_in", "wxid_healthy", "")
+            ), patch.object(
+                manager, "_request_json_direct", return_value={"status": "logged_in"}
+            ) as request_mock, patch.object(
+                engine, "exec_container", side_effect=export_exec
+            ):
+                status = manager.status(account)
+                api_result = manager.api_request(account, "GET", "/api/status/auth")
+                desktop_result = manager.desktop(account, desktop_provider="novnc")
+                export_result = manager.export_db_keys(account)
+
+            self.assertEqual(status["runtime_health"], "healthy")
+            self.assertEqual(status["resource_policy_drift"], {})
+            self.assertFalse(status["resource_reconcile_required"])
+            self.assertEqual(api_result, {"status": "logged_in"})
+            request_mock.assert_called_once()
+            self.assertEqual(desktop_result["desktop_provider"], "novnc")
+            self.assertTrue(desktop_result["path"].startswith("/desktop/"))
+            self.assertEqual(export_result["credentials"][0]["account_dir"], "wxid_healthy")
+            exec_ops = [item for item in engine.operations if item[0] == "exec_container"]
+            self.assertEqual(len(exec_ops), 2)
+            self.assertEqual({item[1] for item in exec_ops}, {container_id})
+
+    def test_controlled_restart_restores_quarantined_functions(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-restore", "display_name": "Restore", "runtime_provider": "agent_wechat"}
+        old_container_id = "fake-restore-256"
+        engine.containers[old_container_id] = {
+            "Id": old_container_id,
+            "Name": "/" + agent_wechat_runtime.AgentWechatManager.container_name(account),
+            "Config": {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-restore"),
+            },
+            "HostConfig": {"PidsLimit": 256, "Memory": 2048 * 1024 * 1024},
+            "State": {"Running": True},
+            "NetworkSettings": {"Ports": {}},
+        }
+
+        def dynamic_exec(identifier, command, *, env=None, timeout=30.0, attach_stderr=True):
+            del env, timeout, attach_stderr
+            engine.operations.append(("exec_container", engine._resolve(identifier), list(command)))
+            if any("sqlcipher" in str(part) for part in command):
+                rows = [{"account_dir": "wxid_restore", "db_name": "session.db", "hex_key": "cd" * 32, "verified_at": ""}]
+                return 0, b"ok\n" + json.dumps(rows).encode("utf-8")
+            return 0, b"state=restarted\n"
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"WECHAT_DESKTOP_GATEWAY_SESSION_DIR": temp}, clear=False
+        ):
+            root = Path(temp)
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "agent.db").write_bytes(b"sqlite")
+            with patch.object(
+                manager, "runtime_storage_root", return_value=root
+            ), patch.object(manager, "_token", return_value="a" * 64), patch.object(
+                manager, "_persist_status", side_effect=lambda acc, status: status
+            ), patch.object(
+                manager,
+                "_probe_agent_server",
+                side_effect=AssertionError("quarantined status must not probe /health"),
+            ), patch.object(
+                manager,
+                "_probe_wechat_login",
+                side_effect=AssertionError("quarantined status must not probe auth API"),
+            ), patch.object(
+                manager,
+                "_ensure_login_flow",
+                side_effect=AssertionError("quarantined account must not start login"),
+            ):
+                engine.operations.clear()
+                with self.assertRaisesRegex(agent_wechat_runtime.AgentWechatRuntimeError, "controlled restart required"):
+                    manager.desktop(account, desktop_provider="novnc")
+                with self.assertRaisesRegex(agent_wechat_runtime.AgentWechatRuntimeError, "controlled restart required"):
+                    manager.start_login(account)
+                with self.assertRaisesRegex(agent_wechat_runtime.AgentWechatRuntimeError, "controlled restart required"):
+                    manager.export_db_keys(account)
+                self.assertEqual([item for item in engine.operations if item[0] == "exec_container"], [])
+                self.assertEqual([item for item in engine.operations if item[0] == "create_container"], [])
+
+            with patch.object(
+                manager, "_host_config_root_and_network", return_value=("/host/root", "wechat-hub_net")
+            ), patch.object(
+                manager, "_ensure_volumes", return_value=("restore-data", "restore-home", "/host/token")
+            ), patch.object(
+                manager, "_ensure_desktop_volumes", return_value=("restore-x11", "restore-files")
+            ), patch.object(
+                manager, "_reset_x11_socket_dir"
+            ), patch.object(
+                manager, "_probe_agent_server", return_value=(True, "")
+            ), patch.object(
+                manager, "_probe_wechat_login", return_value=("logged_in", "wxid_restore", "")
+            ), patch.object(
+                engine, "exec_container", side_effect=dynamic_exec
+            ):
+                restarted = manager.restart(account)
+
+            active = manager._find_container(account)
+            self.assertIsNotNone(active)
+            self.assertNotEqual(active["Id"], old_container_id)
+            self.assertEqual(active["HostConfig"]["PidsLimit"], 512)
+            self.assertEqual(restarted["resource_policy_drift"], {})
+            self.assertFalse(restarted["resource_reconcile_required"])
+
+            with patch.object(
+                manager, "runtime_storage_root", return_value=root
+            ), patch.object(
+                manager, "_persist_status", side_effect=lambda acc, status: status
+            ), patch.object(
+                manager, "_probe_agent_server", return_value=(True, "")
+            ), patch.object(
+                manager, "_probe_wechat_login", return_value=("logged_in", "wxid_restore", "")
+            ), patch.object(
+                manager, "_request_json_direct", return_value={"status": "logged_in"}
+            ), patch.object(
+                engine, "exec_container", side_effect=dynamic_exec
+            ):
+                status = manager.status(account)
+                api_result = manager.api_request(account, "GET", "/api/status/auth")
+                desktop_result = manager.desktop(account, desktop_provider="novnc")
+                export_result = manager.export_db_keys(account)
+
+            self.assertEqual(status["runtime_health"], "healthy")
+            self.assertEqual(api_result, {"status": "logged_in"})
+            self.assertEqual(desktop_result["desktop_provider"], "novnc")
+            self.assertEqual(export_result["credentials"][0]["account_dir"], "wxid_restore")
+            self.assertGreaterEqual(len([item for item in engine.operations if item[0] == "exec_container"]), 3)
+
+
+    def test_export_db_keys_executes_against_inspected_container_id_not_container_name(self):
+        engine = FakeDockerEngine()
+        manager = agent_wechat_runtime.AgentWechatManager(engine=engine)
+        account = {"id": "acc-rename", "display_name": "Renamed", "runtime_provider": "agent_wechat"}
+        container_id = "export-parent-777"
+        renamed_name = "renamed-managed-primary"
+        engine.containers[container_id] = {
+            "Id": container_id,
+            "Name": "/" + renamed_name,
+            "Config": {
+                "Image": "ghcr.io/thisnick/agent-wechat:0.11.15",
+                "Labels": agent_wechat_runtime._labels("acc-rename"),
+            },
+            "HostConfig": {"PidsLimit": 512, "Memory": 2048 * 1024 * 1024},
+            "State": {"Running": True},
+            "NetworkSettings": {"Ports": {}},
+        }
+
+        def export_exec(identifier, command, *, env=None, timeout=30.0, attach_stderr=True):
+            del env, timeout, attach_stderr
+            engine.exec_identifier = identifier
+            engine.operations.append(("exec_container", engine._resolve(identifier), list(command)))
+            rows = [{"account_dir": "wx_renamed", "db_name": "session.db", "hex_key": "12" * 32, "verified_at": ""}]
+            return 0, b"ok\n" + json.dumps(rows).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "data").mkdir(exist_ok=True)
+            (root / "data" / "agent.db").write_bytes(b"sqlite")
+            with patch.object(manager, "runtime_storage_root", return_value=root), patch.object(
+                manager, "_token", return_value="a" * 64
+            ), patch.object(
+                engine, "exec_container", side_effect=export_exec
+            ):
+                result = manager.export_db_keys(account)
+
+            self.assertEqual(engine.exec_identifier, "export-parent-777")
+            self.assertNotEqual(engine.exec_identifier, manager.container_name(account))
+            self.assertNotEqual(engine.exec_identifier, renamed_name)
+            self.assertEqual(result["credentials"][0]["account_dir"], "wx_renamed")
 
 
 if __name__ == "__main__":

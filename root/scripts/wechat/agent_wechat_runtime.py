@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import logging
 import os
 import re
 import secrets
@@ -38,6 +39,8 @@ DEFAULT_DESKTOP_GATEWAY_PORT = 17892
 SELKIES_ATTACH_PORT = 8081
 MANAGED_LABEL = "com.wechat-hub.managed"
 ACCOUNT_LABEL = "com.wechat-hub.account-id"
+
+logger = logging.getLogger("agent_wechat_runtime")
 PROVIDER_LABEL = "com.wechat-hub.provider"
 PROVIDER = "agent_wechat"
 SELKIES_PROVIDER = "agent_wechat_selkies"
@@ -916,6 +919,7 @@ class AgentWechatManager:
         if primary is None or not bool((primary.get("State") or {}).get("Running")):
             raise AgentWechatRuntimeError("AgentWechat container is not running")
         parent_id = self._validate_managed_container(account, primary)
+        self._assert_no_running_resource_drift(account, primary)
         if not self._selkies_attach_mounts_ready(primary):
             raise AgentWechatRuntimeError(
                 "Selkies desktop requires one normal account restart to attach the shared X11/files volumes"
@@ -982,6 +986,39 @@ class AgentWechatManager:
             self._remove_selkies_container(account)
             raise
 
+    @classmethod
+    def _desired_primary_resource_policy(
+        cls, account: dict[str, Any] | None = None
+    ) -> dict[str, int]:
+        del account
+        return {
+            "PidsLimit": _bounded_int_env(
+                "AGENT_WECHAT_PIDS_LIMIT", 512, minimum=64, maximum=1024
+            ),
+            "Memory": _bounded_int_env(
+                "AGENT_WECHAT_MEM_LIMIT_MB", 2048, minimum=512, maximum=8192
+            )
+            * 1024
+            * 1024,
+        }
+
+    @classmethod
+    def _primary_resource_policy_drift(
+        cls, inspected: dict[str, Any] | None, account: dict[str, Any] | None = None
+    ) -> dict[str, dict[str, int]]:
+        if not inspected:
+            return {}
+        host_config = inspected.get("HostConfig") or {}
+        if not isinstance(host_config, dict):
+            return {}
+        desired = cls._desired_primary_resource_policy(account)
+        drift: dict[str, dict[str, int]] = {}
+        for key, desired_value in desired.items():
+            current_value = host_config.get(key)
+            if current_value != desired_value:
+                drift[key] = {"current": current_value, "desired": desired_value}
+        return drift
+
     def _container_payload(
         self,
         account: dict[str, Any],
@@ -1030,14 +1067,8 @@ class AgentWechatManager:
                 "NetworkMode": network,
                 "IpcMode": "shareable",
                 "ShmSize": shm_size,
-                "PidsLimit": _bounded_int_env(
-                    "AGENT_WECHAT_PIDS_LIMIT", 256, minimum=64, maximum=1024
-                ),
-                "Memory": _bounded_int_env(
-                    "AGENT_WECHAT_MEM_LIMIT_MB", 2048, minimum=512, maximum=8192
-                )
-                * 1024
-                * 1024,
+                "PidsLimit": self._desired_primary_resource_policy(account)["PidsLimit"],
+                "Memory": self._desired_primary_resource_policy(account)["Memory"],
             },
             "NetworkingConfig": {"EndpointsConfig": {network: {"Aliases": [name]}}},
         }
@@ -1052,11 +1083,20 @@ class AgentWechatManager:
             current_image = str(existing.get("Config", {}).get("Image") or "")
             running = bool(existing.get("State", {}).get("Running"))
             needs_desktop_mounts = not self._selkies_attach_mounts_ready(existing)
+            resource_drift = self._primary_resource_policy_drift(existing, account)
             if not running:
                 self._reset_x11_socket_dir(account)
-            if (current_image != desired_image or needs_desktop_mounts) and not running:
+            if (current_image != desired_image or needs_desktop_mounts or bool(resource_drift)) and not running:
                 self.engine.remove_container(str(existing.get("Id") or self.container_name(account)), force=False)
                 existing = None
+            elif running and resource_drift:
+                logger.warning(
+                    "agent-wechat container %s for account %s has resource policy drift: %s; "
+                    "refusing inline recreation while running, awaiting controlled stop/reconcile",
+                    existing.get("Id") or self.container_name(account),
+                    account.get("id"),
+                    resource_drift,
+                )
         else:
             self._reset_x11_socket_dir(account)
         if existing is None:
@@ -1076,9 +1116,9 @@ class AgentWechatManager:
             raise AgentWechatRuntimeError("agent-wechat container creation did not produce an inspectable container")
         return existing
 
-    @staticmethod
-    def _status_from_inspect(account: dict[str, Any], inspected: dict[str, Any] | None) -> dict[str, Any]:
-        desired = AgentWechatManager.image_for(account)
+    @classmethod
+    def _status_from_inspect(cls, account: dict[str, Any], inspected: dict[str, Any] | None) -> dict[str, Any]:
+        desired = cls.image_for(account)
         base = {
             "account_id": account["id"],
             "display_name": str(account.get("display_name") or account["id"]),
@@ -1093,7 +1133,7 @@ class AgentWechatManager:
             "pids": [],
             "windows": [],
             "window_error": None,
-            "container_name": AgentWechatManager.container_name(account),
+            "container_name": cls.container_name(account),
             "container_id": "",
             "image": desired,
             "current_image": "",
@@ -1111,6 +1151,8 @@ class AgentWechatManager:
                 "desktop": True,
                 "native": False,
             },
+            "resource_policy_drift": {},
+            "resource_reconcile_required": False,
         }
         if inspected is None:
             return base
@@ -1120,6 +1162,9 @@ class AgentWechatManager:
         base["current_image"] = str(inspected.get("Config", {}).get("Image") or "")
         base["running"] = bool(inspected.get("State", {}).get("Running"))
         base["container_running"] = base["running"]
+        drift = cls._primary_resource_policy_drift(inspected, account)
+        base["resource_policy_drift"] = drift
+        base["resource_reconcile_required"] = bool(base["running"] and drift)
         return base
 
     def _internal_url(self, account: dict[str, Any], path: str) -> str:
@@ -1210,6 +1255,16 @@ class AgentWechatManager:
             status["logged_in_user"] = ""
             return status
 
+        drift_error = self._running_resource_drift_error(account)
+        if drift_error:
+            status["agent_server_healthy"] = None
+            status["runtime_health"] = "degraded"
+            status["health_error"] = drift_error
+            status["wechat_login_status"] = "quarantined-resource-drift"
+            status["logged_in_user"] = ""
+            status["resource_reconcile_required"] = True
+            return status
+
         health_timeout = 3.0 if probe_timeout is None else max(0.5, float(probe_timeout))
         login_timeout = 5.0 if probe_timeout is None else max(0.5, float(probe_timeout))
         healthy, health_error = self._probe_agent_server(account, timeout=health_timeout)
@@ -1265,12 +1320,37 @@ class AgentWechatManager:
             or str(labels.get(PROVIDER_LABEL) or "") != PROVIDER
         ):
             raise AgentWechatRuntimeError(
-                f"refusing desktop exec: container labels do not match managed account {expected_account_id}"
+                f"refusing managed container operation: container labels do not match managed account {expected_account_id}"
             )
         identifier = str(inspected.get("Id") or "")
         if not identifier:
-            raise AgentWechatRuntimeError("refusing desktop exec: managed container has no id")
+            raise AgentWechatRuntimeError("refusing managed container operation: managed container has no id")
         return identifier
+
+    def _running_resource_drift_error(
+        self, account: dict[str, Any], inspected: dict[str, Any] | None = None
+    ) -> str:
+        if inspected is None:
+            engine = self.engine
+            if not hasattr(engine, "managed_containers") or not hasattr(engine, "inspect_container"):
+                return ""
+            inspected = self._find_container(account)
+        if not inspected or not bool((inspected.get("State") or {}).get("Running")):
+            return ""
+        drift = self._primary_resource_policy_drift(inspected, account)
+        if not drift:
+            return ""
+        return (
+            "agent-wechat container is quarantined due to running resource policy drift "
+            f"({drift}); controlled restart required"
+        )
+
+    def _assert_no_running_resource_drift(
+        self, account: dict[str, Any], inspected: dict[str, Any] | None = None
+    ) -> None:
+        error = self._running_resource_drift_error(account, inspected)
+        if error:
+            raise AgentWechatRuntimeError(error)
 
     def ensure_interactive_desktop(self, account: dict[str, Any]) -> dict[str, Any]:
         """Reconcile upstream's default x11vnc into safe interactive mode.
@@ -1290,6 +1370,7 @@ class AgentWechatManager:
         identifier = self._validate_managed_container(account, inspected)
         if not bool((inspected.get("State") or {}).get("Running")):
             raise AgentWechatRuntimeError("agent-wechat desktop container is stopped")
+        self._assert_no_running_resource_drift(account, inspected)
         exit_code, output = self.engine.exec_container(
             identifier,
             list(INTERACTIVE_DESKTOP_COMMAND),
@@ -1319,13 +1400,26 @@ class AgentWechatManager:
         if not bool(inspected.get("State", {}).get("Running")):
             self.engine.start_container(identifier)
         refreshed = self.engine.inspect_container(identifier)
+        is_running = bool((refreshed.get("State") or {}).get("Running")) if refreshed else False
+        drift = self._primary_resource_policy_drift(refreshed, account) if refreshed else {}
         desktop = None
-        if refreshed is not None and bool((refreshed.get("State") or {}).get("Running")):
+        if is_running and not drift:
             desktop = self.ensure_interactive_desktop(account)
         result = self._enrich_health(account, self._status_from_inspect(account, refreshed))
         if desktop:
             result["interactive_desktop"] = desktop
-        result["action"] = "started" if result["running"] else "launch-dispatched"
+        if is_running and drift:
+            logger.warning(
+                "agent-wechat container %s for account %s has resource policy drift: %s; "
+                "skipping interactive desktop exec to avoid EAGAIN under pressure, controlled restart required",
+                identifier,
+                account.get("id"),
+                drift,
+            )
+            result["action"] = "running-resource-drift"
+            result["resource_reconcile_required"] = True
+        else:
+            result["action"] = "started" if result["running"] else "launch-dispatched"
         if result["current_image"] and result["current_image"] != result["image"]:
             result["image_update_pending"] = True
         return self._persist_status(account, result)
@@ -1704,6 +1798,7 @@ class AgentWechatManager:
             raise AgentWechatRuntimeError(
                 str(status.get("health_error") or "agent-wechat desktop upstream is unhealthy")
             )
+        self._assert_no_running_resource_drift(account)
         requested_provider = str(desktop_provider or "auto").strip().lower().replace("-", "_")
         if requested_provider not in {"auto", "selkies", "novnc", "no_vnc"}:
             raise AgentWechatRuntimeError("desktop_provider must be auto, selkies, or novnc")
@@ -1812,9 +1907,11 @@ class AgentWechatManager:
         state_db = self.runtime_storage_root(account) / "data" / "agent.db"
         if not state_db.is_file():
             raise AgentWechatRuntimeError(f"agent-wechat state DB is unavailable: {state_db}")
-        container = self.engine.inspect_container(self.container_name(account))
+        container = self._find_container(account)
         if not container or not bool((container.get("State") or {}).get("Running")):
             raise AgentWechatRuntimeError("agent-wechat state DB requires a running upstream container")
+        identifier = self._validate_managed_container(account, container)
+        self._assert_no_running_resource_drift(account, container)
 
         token = self._token(account)
         if not re.fullmatch(r"[A-Fa-f0-9]{32,256}", token):
@@ -1833,7 +1930,7 @@ class AgentWechatManager:
             "AGENT_SQL\n",
         ]
         exit_code, output = self.engine.exec_container(
-            self.container_name(account),
+            identifier,
             command,
             env=[f"AGENT_TOKEN={token}"],
             timeout=30.0,
