@@ -258,12 +258,18 @@ def dispatch_action(registry: Registry, request: dict[str, Any]) -> dict[str, An
         data = registry.load(create=False)
         account = find_account(data, account_id)
         if action == "update":
+            alias_req = str(request.get("runtime_alias")).strip() if request.get("runtime_alias") is not None else None
+            current_alias = str(account.get("runtime_alias") or account.get("id") or "").strip()
+            if alias_req and alias_req != current_alias:
+                raise RuntimeErrorWithHint(
+                    "runtime_alias rename is deferred in this release to protect legacy account bindings; display_name can be updated freely"
+                )
             return {
                 "account": update_account(
                     registry,
                     account_id,
                     display_name=str(request.get("display_name")).strip() if request.get("display_name") is not None else None,
-                    runtime_alias=str(request.get("runtime_alias")).strip() if request.get("runtime_alias") is not None else None,
+                    runtime_alias=alias_req,
                     enabled=_bool(request, "enabled", None) if "enabled" in request else None,
                     autostart=_bool(request, "autostart", None) if "autostart" in request else None,
                 )

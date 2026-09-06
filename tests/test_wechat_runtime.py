@@ -3167,6 +3167,44 @@ class IdentityV2RuntimeTests(unittest.TestCase):
                 )
                 self.assertEqual(res2["account"]["display_name"], "Updated via UUID")
 
+    def test_a8_11_alias_rename_via_control_action_is_fail_closed(self):
+        """11. Alias rename requests via control action or CLI are fail-closed in this release (P0-I2, Gate F8)."""
+        with tempfile.TemporaryDirectory() as temp:
+            paths = self.make_paths(Path(temp))
+            registry = wechat_runtime.Registry(paths)
+            with patch.object(wechat_runtime, "require_root"):
+                acc = wechat_runtime.register_account(
+                    registry, "account_f8", "Original Display", False, provider="agent_wechat"
+                )
+                orig_uuid = acc["instance_uuid"]
+                orig_res_key = acc["resource_key"]
+
+                # 1. Alias rename via dispatch_action must raise RuntimeErrorWithHint
+                with self.assertRaises(wechat_runtime.RuntimeErrorWithHint) as ctx:
+                    wechat_runtime_control.dispatch_action(
+                        registry,
+                        {
+                            "action": "update",
+                            "account_id": "account_f8",
+                            "runtime_alias": "renamed_f8",
+                        },
+                    )
+                self.assertIn("runtime_alias rename is deferred in this release", str(ctx.exception))
+
+                # 2. Same alias or None with display_name update succeeds
+                res = wechat_runtime_control.dispatch_action(
+                    registry,
+                    {
+                        "action": "update",
+                        "account_id": "account_f8",
+                        "runtime_alias": "account_f8",
+                        "display_name": "Allowed Display Update",
+                    },
+                )
+                self.assertEqual(res["account"]["display_name"], "Allowed Display Update")
+                self.assertEqual(res["account"]["instance_uuid"], orig_uuid)
+                self.assertEqual(res["account"]["resource_key"], orig_res_key)
+
 
 if __name__ == "__main__":
     unittest.main()

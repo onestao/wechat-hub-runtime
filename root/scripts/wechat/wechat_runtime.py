@@ -1268,11 +1268,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
 
         if args.command == "update":
+            alias_req = str(args.alias).strip() if args.alias is not None else None
+            account = find_account(data, args.account)
+            current_alias = str(account.get("runtime_alias") or account.get("id") or "").strip()
+            if alias_req and alias_req != current_alias:
+                raise RuntimeErrorWithHint(
+                    "runtime_alias rename is deferred in this release to protect legacy account bindings; display_name can be updated freely"
+                )
             result = update_account(
                 registry,
                 args.account,
                 display_name=args.name,
-                runtime_alias=args.alias,
+                runtime_alias=alias_req,
             )
             print_result(result, args.json)
             return 0
