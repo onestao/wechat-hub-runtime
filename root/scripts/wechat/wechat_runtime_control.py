@@ -32,6 +32,7 @@ from wechat_runtime import (
     status_for,
     stop_account,
     unregister_account,
+    update_account,
     account_environment,
     user_exec_prefix,
 )
@@ -61,9 +62,21 @@ def login_status_for(account: dict[str, Any]) -> dict[str, Any]:
         return AgentWechatManager().login_status(account)
     status = status_for(account)
     selected = _preferred_window(status)
+    alias = str(account.get("runtime_alias") or account.get("id") or "")
+    uuid_val = str(account.get("instance_uuid") or "")
+    display = str(account.get("display_name") or alias)
+    res_key = str(account.get("resource_key") or "")
     return {
+        "instance_uuid": uuid_val,
+        "runtime_alias": alias,
         "account_id": account["id"],
-        "display_name": str(account.get("display_name") or account["id"]),
+        "display_name": display,
+        "resource_key": res_key,
+        "container_id": "",
+        "runtime_provider": "legacy",
+        "logged_in_user": "",
+        "identity_observed_at": None,
+        "wechat_profile": None,
         "running": bool(status.get("running")),
         "pids": list(status.get("pids") or []),
         "windows": list(status.get("windows") or []),
@@ -157,9 +170,17 @@ def _list_status_for(account: dict[str, Any]) -> dict[str, Any]:
 
 def _degraded_list_status(account: dict[str, Any], exc: Exception) -> dict[str, Any]:
     provider = runtime_provider(account)
+    alias = str(account.get("runtime_alias") or account.get("id") or "")
+    uuid_val = str(account.get("instance_uuid") or "")
+    display = str(account.get("display_name") or alias)
+    res_key = str(account.get("resource_key") or "")
     return {
+        "instance_uuid": uuid_val,
+        "runtime_alias": alias,
         "account_id": str(account["id"]),
-        "display_name": str(account.get("display_name") or account["id"]),
+        "display_name": display,
+        "resource_key": res_key,
+        "container_id": "",
         "runtime_provider": provider,
         "enabled": bool(account.get("enabled", True)),
         "autostart": bool(account.get("autostart", True)),
@@ -168,7 +189,10 @@ def _degraded_list_status(account: dict[str, Any], exc: Exception) -> dict[str, 
         "container_running": None if provider == "agent_wechat" else False,
         "agent_server_healthy": False if provider == "agent_wechat" else None,
         "runtime_health": "degraded",
-        "wechat_login_status": "unknown" if provider == "agent_wechat" else "unknown",
+        "wechat_login_status": "unknown",
+        "logged_in_user": "",
+        "identity_observed_at": None,
+        "wechat_profile": None,
         "pids": [],
         "windows": [],
         "health_error": str(exc),
@@ -211,7 +235,7 @@ def dispatch_action(registry: Registry, request: dict[str, Any]) -> dict[str, An
             data = registry.load(create=False)
             return {"ok": True, "accounts": len(data["accounts"])}
 
-        account_id = str(request.get("account_id") or "").strip()
+        account_id = str(request.get("account_id") or request.get("instance_uuid") or "").strip()
         if not account_id:
             raise ValueError("account_id is required")
 
@@ -223,6 +247,9 @@ def dispatch_action(registry: Registry, request: dict[str, Any]) -> dict[str, An
                 _bool(request, "autostart", True),
                 str(request.get("display_name") or "").strip() or None,
                 str(request.get("runtime_provider") or request.get("provider") or "legacy"),
+                instance_uuid=str(request.get("instance_uuid") or "").strip() or None,
+                runtime_alias=str(request.get("runtime_alias") or "").strip() or None,
+                resource_key=str(request.get("resource_key") or "").strip() or None,
             )
             if _bool(request, "start", True):
                 return {"account": account, "status": start_account(account, registry.paths)}
@@ -230,6 +257,17 @@ def dispatch_action(registry: Registry, request: dict[str, Any]) -> dict[str, An
 
         data = registry.load(create=False)
         account = find_account(data, account_id)
+        if action == "update":
+            return {
+                "account": update_account(
+                    registry,
+                    account_id,
+                    display_name=str(request.get("display_name")).strip() if request.get("display_name") is not None else None,
+                    runtime_alias=str(request.get("runtime_alias")).strip() if request.get("runtime_alias") is not None else None,
+                    enabled=_bool(request, "enabled", None) if "enabled" in request else None,
+                    autostart=_bool(request, "autostart", None) if "autostart" in request else None,
+                )
+            }
         if action == "start":
             return {"status": start_account(account, registry.paths)}
         if action == "stop":

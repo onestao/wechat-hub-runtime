@@ -20,7 +20,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
+import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
@@ -38,7 +41,10 @@ except ImportError:  # pragma: no cover - lets pure registry tests run on Window
     pwd = None
 
 
-REGISTRY_VERSION = 1
+REGISTRY_VERSION = 2
+INSTANCE_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 DEFAULT_ACCOUNT_ID = "default"
 DEFAULT_UID_BASE = 20000
@@ -91,6 +97,19 @@ def validate_account_id(account_id: str) -> str:
     return account_id
 
 
+def validate_instance_uuid(instance_uuid: str) -> str:
+    raw = str(instance_uuid).strip()
+    try:
+        parsed = uuid.UUID(raw)
+        return str(parsed)
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError(f"invalid instance_uuid: {instance_uuid!r}")
+
+
+def validate_runtime_alias(runtime_alias: str) -> str:
+    return validate_account_id(runtime_alias)
+
+
 def account_username(account_id: str) -> str:
     validate_account_id(account_id)
     normalized = re.sub(r"[^a-z0-9_]", "_", account_id.lower())
@@ -111,6 +130,20 @@ def sanitize_account_runtime_name(account_id: str) -> str:
     normalized = (normalized or "account")[:32].rstrip("-") or "account"
     digest = hashlib.sha256(account_id.encode("utf-8")).hexdigest()[:8]
     return f"{normalized}-{digest}"
+
+
+def derive_legacy_resource_key(account: Dict[str, Any]) -> str:
+    """Extract existing resource suffix or derive a stable Docker-safe key."""
+    aw = account.get("agent_wechat")
+    if isinstance(aw, dict):
+        cname = str(aw.get("container_name") or "")
+        if cname.startswith("wechat-agent-"):
+            return cname.removeprefix("wechat-agent-")
+        dvol = str(aw.get("data_volume") or "")
+        if dvol.startswith("wechat-agent-") and dvol.endswith("-data"):
+            return dvol.removeprefix("wechat-agent-").removesuffix("-data")
+    target = str(account.get("runtime_alias") or account.get("id") or "account")
+    return sanitize_account_runtime_name(target)
 
 
 def runtime_provider(account: Dict[str, Any]) -> str:
@@ -167,23 +200,43 @@ def parse_display_map(raw: Optional[str]) -> Dict[str, str]:
 class Registry:
     def __init__(self, paths: RuntimePaths):
         self.paths = paths
+        self._lock_depth = 0
+        self._lock_handle = None
+        self._thread_lock = threading.RLock()
 
     @contextlib.contextmanager
     def locked(self) -> Iterator[None]:
-        self.paths.runtime_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = self.paths.runtime_dir / "registry.lock"
-        with lock_path.open("a+", encoding="utf-8") as handle:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        with self._thread_lock:
+            self.paths.runtime_dir.mkdir(parents=True, exist_ok=True)
+            lock_path = self.paths.runtime_dir / "registry.lock"
+            if self._lock_depth == 0:
+                self._lock_handle = lock_path.open("a+", encoding="utf-8")
+                if fcntl is not None:
+                    fcntl.flock(self._lock_handle.fileno(), fcntl.LOCK_EX)
+            self._lock_depth += 1
             try:
                 yield
             finally:
-                if fcntl is not None:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                self._lock_depth -= 1
+                if self._lock_depth == 0:
+                    try:
+                        if fcntl is not None and self._lock_handle is not None:
+                            fcntl.flock(self._lock_handle.fileno(), fcntl.LOCK_UN)
+                    finally:
+                        if self._lock_handle is not None:
+                            self._lock_handle.close()
+                            self._lock_handle = None
 
     def load(self, create: bool = False) -> Dict[str, Any]:
         if self.paths.registry_file.exists():
             data = json.loads(self.paths.registry_file.read_text(encoding="utf-8"))
+            if self._needs_migration(data):
+                with self.locked():
+                    # Re-read inside lock in case another process already migrated
+                    data = json.loads(self.paths.registry_file.read_text(encoding="utf-8"))
+                    if self._needs_migration(data):
+                        data = self._migrate_registry_data(data)
+                        self.save(data)
             self._validate(data)
             return data
         if not create:
@@ -193,6 +246,83 @@ class Registry:
         data = self._initial_registry()
         self.save(data)
         return data
+
+    def _needs_migration(self, data: Dict[str, Any]) -> bool:
+        if data.get("version") != REGISTRY_VERSION:
+            return True
+        accounts = data.get("accounts")
+        if not isinstance(accounts, list):
+            return False
+        for acc in accounts:
+            if not isinstance(acc, dict):
+                return False
+            if not acc.get("instance_uuid"):
+                return True
+            if not acc.get("runtime_alias"):
+                return True
+            if not acc.get("resource_key"):
+                return True
+            if not acc.get("display_name"):
+                return True
+            if "id" not in acc:
+                return True
+        return False
+
+    def _migrate_registry_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        new_data = dict(data)
+        new_data["version"] = REGISTRY_VERSION
+        accounts = new_data.get("accounts")
+        if not isinstance(accounts, list):
+            return new_data
+
+        seen_uuids = set()
+        for acc in accounts:
+            if isinstance(acc, dict) and acc.get("instance_uuid"):
+                seen_uuids.add(str(acc["instance_uuid"]).lower())
+
+        for acc in accounts:
+            if not isinstance(acc, dict):
+                continue
+            # 1. instance_uuid: generate once under lock if missing
+            if not acc.get("instance_uuid"):
+                while True:
+                    candidate = str(uuid.uuid4())
+                    if candidate.lower() not in seen_uuids:
+                        acc["instance_uuid"] = candidate
+                        seen_uuids.add(candidate.lower())
+                        break
+
+            # 2. runtime_alias: if missing, use id
+            if not acc.get("runtime_alias"):
+                raw_id = str(acc.get("id") or "").strip()
+                acc["runtime_alias"] = raw_id or f"acc_{acc['instance_uuid'][:8]}"
+
+            # 3. id: backward-compatibility alias, must equal runtime_alias
+            acc["id"] = acc["runtime_alias"]
+
+            # 4. display_name: if missing, use display_name or runtime_alias
+            if not acc.get("display_name"):
+                acc["display_name"] = acc["runtime_alias"]
+
+            # 5. resource_key: solidify existing resources so NO renaming occurs
+            if not acc.get("resource_key"):
+                acc["resource_key"] = derive_legacy_resource_key(acc)
+
+            # 6. runtime_provider
+            if not acc.get("runtime_provider"):
+                acc["runtime_provider"] = "agent_wechat" if "agent_wechat" in acc else "legacy"
+
+            # 7. agent_wechat inner consistency
+            if acc["runtime_provider"] == "agent_wechat" and "agent_wechat" in acc:
+                aw = acc["agent_wechat"]
+                if isinstance(aw, dict):
+                    safe = acc["resource_key"]
+                    aw.setdefault("container_name", f"wechat-agent-{safe}")
+                    aw.setdefault("data_volume", f"wechat-agent-{safe}-data")
+                    aw.setdefault("home_volume", f"wechat-agent-{safe}-home")
+                    aw.setdefault("token_file", f"/config/agent-wechat/{safe}/auth-token")
+
+        return new_data
 
     def save(self, data: Dict[str, Any]) -> None:
         self._validate(data)
@@ -229,8 +359,11 @@ class Registry:
                 home = str(self.paths.account_home_root / account_id / "home")
             accounts.append(
                 {
+                    "instance_uuid": str(uuid.uuid4()),
+                    "runtime_alias": account_id,
                     "id": account_id,
                     "display_name": account_id,
+                    "resource_key": sanitize_account_runtime_name(account_id),
                     "username": username,
                     "uid": uid,
                     "display": display_map.get(account_id, default_display),
@@ -250,39 +383,75 @@ class Registry:
 
     @staticmethod
     def _validate(data: Dict[str, Any]) -> None:
-        if data.get("version") != REGISTRY_VERSION:
+        version = data.get("version")
+        if version not in (1, 2):
             raise RuntimeErrorWithHint(
-                f"unsupported registry version: {data.get('version')!r}"
+                f"unsupported registry version: {version!r}"
             )
         accounts = data.get("accounts")
         if not isinstance(accounts, list):
             raise RuntimeErrorWithHint("registry accounts must be a list")
-        seen_ids = set()
+        seen_aliases = set()
+        seen_uuids = set()
         seen_users = set()
+        seen_resource_keys = set()
         for account in accounts:
             if not isinstance(account, dict):
                 raise RuntimeErrorWithHint("registry account entry must be an object")
-            account_id = validate_account_id(str(account.get("id", "")))
+            raw_alias = account.get("runtime_alias") or account.get("id")
+            if not raw_alias:
+                raise RuntimeErrorWithHint("missing account id or runtime_alias")
+            account_id = validate_runtime_alias(str(raw_alias))
             runtime_provider(account)
+
+            if version == 2 or "instance_uuid" in account:
+                raw_uuid = account.get("instance_uuid")
+                if not raw_uuid:
+                    raise RuntimeErrorWithHint(f"missing instance_uuid for account {account_id}")
+                validated_uuid = validate_instance_uuid(str(raw_uuid)).lower()
+                if validated_uuid in seen_uuids:
+                    raise RuntimeErrorWithHint(f"duplicate instance_uuid: {raw_uuid}")
+                seen_uuids.add(validated_uuid)
+
+            if version == 2 or "resource_key" in account:
+                res_key = str(account.get("resource_key") or "").strip()
+                if not res_key:
+                    raise RuntimeErrorWithHint(f"missing resource_key for account {account_id}")
+                if res_key in seen_resource_keys:
+                    raise RuntimeErrorWithHint(f"duplicate resource_key: {res_key}")
+                seen_resource_keys.add(res_key)
+
             username = str(account.get("username", ""))
             if not username:
                 raise RuntimeErrorWithHint(f"missing username for {account_id}")
-            if account_id in seen_ids:
+            if account_id in seen_aliases:
                 raise RuntimeErrorWithHint(f"duplicate account id: {account_id}")
             if username in seen_users:
                 raise RuntimeErrorWithHint(f"duplicate Unix username: {username}")
-            seen_ids.add(account_id)
+            seen_aliases.add(account_id)
             seen_users.add(username)
 
 
-def find_account(data: Dict[str, Any], account_id: str) -> Dict[str, Any]:
-    validate_account_id(account_id)
-    for account in data["accounts"]:
-        if account["id"] == account_id:
+def find_account(data: Dict[str, Any], identifier: str) -> Dict[str, Any]:
+    target = str(identifier).strip()
+    if not target:
+        raise RuntimeErrorWithHint("account identifier cannot be empty")
+    target_lower = target.lower()
+
+    # 1. Search by exact instance_uuid
+    for account in data.get("accounts", []):
+        u = str(account.get("instance_uuid") or "").strip().lower()
+        if u and u == target_lower:
             return account
-    raise RuntimeErrorWithHint(f"unknown WeChat account: {account_id}")
-
-
+    # 2. Search by runtime_alias or id
+    for account in data.get("accounts", []):
+        if str(account.get("runtime_alias") or "") == target or str(account.get("id") or "") == target:
+            return account
+    # 3. Search by resource_key
+    for account in data.get("accounts", []):
+        if str(account.get("resource_key") or "") == target:
+            return account
+    raise RuntimeErrorWithHint(f"unknown WeChat account: {target}")
 def next_registry_uid(data: Dict[str, Any]) -> int:
     configured = [
         int(account["uid"])
@@ -649,10 +818,21 @@ def status_for(account: Dict[str, Any]) -> Dict[str, Any]:
         return AgentWechatManager().status(account)
     pids = account_processes(account)
     windows = account_windows(account)
+    alias = str(account.get("runtime_alias") or account.get("id") or "")
+    display = str(account.get("display_name") or alias)
+    uuid_val = str(account.get("instance_uuid") or "")
+    res_key = str(account.get("resource_key") or "")
     return {
+        "instance_uuid": uuid_val,
+        "runtime_alias": alias,
         "account_id": account["id"],
-        "display_name": str(account.get("display_name") or account["id"]),
+        "display_name": display,
+        "resource_key": res_key,
+        "container_id": "",
         "runtime_provider": "legacy",
+        "logged_in_user": "",
+        "identity_observed_at": None,
+        "wechat_profile": None,
         "enabled": bool(account.get("enabled", True)),
         "autostart": bool(account.get("autostart", True)),
         "legacy": bool(account.get("legacy", False)),
@@ -847,23 +1027,44 @@ def register_account(
     autostart: bool,
     label: Optional[str] = None,
     provider: str = "legacy",
+    instance_uuid: Optional[str] = None,
+    runtime_alias: Optional[str] = None,
+    resource_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    validate_account_id(account_id)
+    alias = validate_runtime_alias(str(runtime_alias or account_id).strip())
     require_root("register")
     provider = str(provider or "legacy").strip().lower()
     if provider not in RUNTIME_PROVIDERS:
         raise ValueError(f"runtime_provider must be one of {sorted(RUNTIME_PROVIDERS)}")
+
     with registry.locked():
         data = registry.load(create=True)
-        if any(item["id"] == account_id for item in data["accounts"]):
-            raise RuntimeErrorWithHint(f"account already exists: {account_id}")
+        if any(item.get("runtime_alias") == alias or item.get("id") == alias for item in data["accounts"]):
+            raise RuntimeErrorWithHint(f"account already exists: {alias}")
+
+        if instance_uuid:
+            uuid_val = validate_instance_uuid(instance_uuid)
+            if any(str(item.get("instance_uuid") or "").lower() == uuid_val.lower() for item in data["accounts"]):
+                raise RuntimeErrorWithHint(f"instance_uuid already exists: {uuid_val}")
+        else:
+            uuid_val = str(uuid.uuid4())
+
+        res_key = str(resource_key or "").strip() or sanitize_account_runtime_name(alias)
+        if any(item.get("resource_key") == res_key for item in data["accounts"]):
+            raise RuntimeErrorWithHint(f"resource_key already exists: {res_key}")
+
+        name = (label or display_name or alias).strip() or alias
+
         if provider == "agent_wechat":
             from agent_wechat_runtime import AgentWechatManager
 
-            safe_name = sanitize_account_runtime_name(account_id)
+            safe_name = res_key
             account = {
-                "id": account_id,
-                "display_name": (label or account_id).strip() or account_id,
+                "instance_uuid": uuid_val,
+                "runtime_alias": alias,
+                "display_name": name,
+                "resource_key": res_key,
+                "id": alias,
                 "username": f"agent_{safe_name}",
                 "uid": None,
                 "display": "isolated",
@@ -884,12 +1085,15 @@ def register_account(
         else:
             uid = next_registry_uid(data)
             account = {
-                "id": account_id,
-                "display_name": (label or account_id).strip() or account_id,
-                "username": account_username(account_id),
+                "instance_uuid": uuid_val,
+                "runtime_alias": alias,
+                "display_name": name,
+                "resource_key": res_key,
+                "id": alias,
+                "username": account_username(alias),
                 "uid": uid,
                 "display": display_name or os.environ.get("DISPLAY", DEFAULT_DISPLAY),
-                "home": str(registry.paths.account_home_root / account_id / "home"),
+                "home": str(registry.paths.account_home_root / alias / "home"),
                 "enabled": True,
                 "autostart": autostart,
                 "legacy": False,
@@ -901,13 +1105,64 @@ def register_account(
         return account
 
 
+def update_account(
+    registry: Registry,
+    identifier: str,
+    *,
+    display_name: Optional[str] = None,
+    runtime_alias: Optional[str] = None,
+    enabled: Optional[bool] = None,
+    autostart: Optional[bool] = None,
+) -> Dict[str, Any]:
+    require_root("update")
+    with registry.locked():
+        data = registry.load(create=True)
+        account = find_account(data, identifier)
+        changed = False
+
+        if display_name is not None:
+            cleaned_display = str(display_name).strip()
+            if not cleaned_display:
+                raise ValueError("display_name cannot be empty")
+            account["display_name"] = cleaned_display
+            changed = True
+
+        if runtime_alias is not None:
+            new_alias = validate_runtime_alias(str(runtime_alias).strip())
+            old_alias = account.get("runtime_alias") or account.get("id")
+            if new_alias != old_alias:
+                for other in data["accounts"]:
+                    if other is account:
+                        continue
+                    if other.get("runtime_alias") == new_alias or other.get("id") == new_alias:
+                        raise RuntimeErrorWithHint(f"runtime_alias already in use: {new_alias}")
+                account["runtime_alias"] = new_alias
+                account["id"] = new_alias
+                changed = True
+
+        if enabled is not None:
+            account["enabled"] = bool(enabled)
+            changed = True
+
+        if autostart is not None:
+            account["autostart"] = bool(autostart)
+            changed = True
+
+        if changed:
+            registry.save(data)
+        return account
+
+
 def unregister_account(
-    registry: Registry, account_id: str, *, purge_data: bool = False
+    registry: Registry, identifier: str, *, purge_data: bool = False
 ) -> Dict[str, Any]:
     require_root("unregister")
     with registry.locked():
         data = registry.load(create=True)
-        account = find_account(data, account_id)
+        account = find_account(data, identifier)
+        target_uuid = account.get("instance_uuid")
+        target_id = account.get("id")
+        target_alias = account.get("runtime_alias")
         if runtime_provider(account) == "agent_wechat":
             from agent_wechat_runtime import AgentWechatManager
 
@@ -915,13 +1170,21 @@ def unregister_account(
         else:
             stop_account(account, registry.paths)
             removal = {
-                "removed": account_id,
+                "instance_uuid": str(target_uuid or ""),
+                "runtime_alias": str(target_alias or target_id or ""),
+                "removed": target_id,
                 "data_preserved": account["home"],
                 "unix_user_preserved": account["username"],
                 "preserve_data": True,
                 "runtime_provider": "legacy",
             }
-        data["accounts"] = [item for item in data["accounts"] if item["id"] != account_id]
+        data["accounts"] = [
+            item for item in data["accounts"]
+            if not (
+                (target_uuid and item.get("instance_uuid") == target_uuid)
+                or (not target_uuid and item.get("id") == target_id)
+            )
+        ]
         registry.save(data)
         return removal
 
@@ -955,7 +1218,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--name", help="human-friendly account display name")
     p.add_argument("--display")
     p.add_argument("--provider", choices=sorted(RUNTIME_PROVIDERS), default="legacy")
+    p.add_argument("--uuid", dest="instance_uuid", help="specific instance UUID")
+    p.add_argument("--alias", dest="runtime_alias", help="specific runtime alias")
     p.add_argument("--no-autostart", action="store_true")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("update", help="update display name or runtime alias")
+    p.add_argument("account")
+    p.add_argument("--name", help="new display name")
+    p.add_argument("--alias", help="new runtime alias")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("unregister", help="remove registry entry, preserving home and Unix user")
@@ -990,6 +1261,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 not args.no_autostart,
                 args.name,
                 args.provider,
+                instance_uuid=args.instance_uuid,
+                runtime_alias=args.runtime_alias,
+            )
+            print_result(result, args.json)
+            return 0
+
+        if args.command == "update":
+            result = update_account(
+                registry,
+                args.account,
+                display_name=args.name,
+                runtime_alias=args.alias,
             )
             print_result(result, args.json)
             return 0
