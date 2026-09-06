@@ -11,6 +11,13 @@ assets first and then upgrades a long-lived binary WebSocket (websockify).
 Access logging is deliberately disabled so gateway session identifiers do not
 become durable log credentials. The upstream token never appears in browser
 URLs, public JSON, redirects, or logs.
+
+Desktop provider selection: Selkies requires a secure browser origin, so
+HTTPS deployments serve the Selkies client while plain-HTTP/LAN deployments
+select noVNC at session creation. A Selkies session opened over plain HTTP is
+transparently downgraded to the session-scoped noVNC client inside the same
+opaque session; anything Selkies-specific that an HTTP browser cannot run
+fails closed with an actionable explanation.
 """
 
 from __future__ import annotations
@@ -39,7 +46,12 @@ except ImportError:  # pragma: no cover - production image installs aiohttp
     WSMsgType = None  # type: ignore[assignment]
     web = None  # type: ignore[assignment]
 
-from agent_wechat_runtime import AGENT_WECHAT_PORT, SELKIES_ATTACH_PORT, AgentWechatManager
+from agent_wechat_runtime import (
+    AGENT_WECHAT_PORT,
+    SELKIES_ATTACH_PORT,
+    AgentWechatManager,
+    public_gateway_scheme,
+)
 from wechat_runtime import Registry, RuntimePaths, find_account, runtime_provider
 
 
@@ -331,6 +343,96 @@ def selkies_upstream_url(account: dict[str, Any], tail: str, query: Any) -> str:
 def desktop_provider(descriptor: dict[str, Any]) -> str:
     provider = str(descriptor.get("desktop_provider") or "novnc").strip().lower()
     return "selkies" if provider == "selkies" else "novnc"
+
+
+def secure_public_origin() -> bool:
+    """Whether the operator's public desktop entry is HTTPS.
+
+    The Gateway never terminates TLS itself, so a plain request could always
+    be spoofed with client-supplied forwarding headers. The deployment-level
+    scheme declaration shared with session selection is the only trusted
+    secure-origin signal; Selkies clients are served only under it.
+    """
+    return public_gateway_scheme() == "https"
+
+
+def descriptor_novnc_reconciled(descriptor: dict[str, Any]) -> bool:
+    """Whether this session's account has a reconciled interactive noVNC.
+
+    Sessions created before this field existed default to False so the
+    Gateway fails closed instead of proxying a dead websockify route.
+    """
+    return bool(descriptor.get("novnc_reconciled"))
+
+
+def downgraded_novnc_descriptor(descriptor: dict[str, Any]) -> dict[str, Any]:
+    """Serve a Selkies session's plain-HTTP browser through the noVNC path.
+
+    Every proxy helper derives its upstream from ``desktop_provider``, so a
+    per-request shallow copy switches the whole serving path to the agent
+    server's noVNC client. The stored session descriptor stays untouched.
+    """
+    return dict(descriptor, desktop_provider="novnc")
+
+
+def downgraded_novnc_location(session_id: str) -> str:
+    """Browser path of the session-scoped noVNC client, mirroring noVNC sessions."""
+    websocket_path = urllib.parse.quote(f"desktop/{session_id}/vnc/websockify", safe="")
+    return f"/desktop/{session_id}/vnc/?autoconnect=true&path={websocket_path}"
+
+
+def secure_origin_required_response() -> Any:
+    """Fail closed for Selkies content a plain-HTTP browser cannot run."""
+
+    assert web is not None
+    return web.Response(
+        status=503,
+        text=(
+            "<!doctype html><html lang=\"zh\"><meta charset=\"utf-8\">"
+            "<title>WeChat Hub Desktop</title><body>"
+            "<p>Selkies 桌面需要 HTTPS 安全来源（secure context）。</p>"
+            "<p>请通过 HTTPS 打开桌面，或从 Console 重新打开桌面以使用 noVNC。</p>"
+            "<p>Selkies desktop requires a secure (HTTPS) browser origin. "
+            "Open the desktop via HTTPS, or reopen it from the Console to use the noVNC fallback.</p>"
+            "</body></html>"
+        ),
+        content_type="text/html",
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+async def downgrade_selkies_to_novnc(
+    request: Any,
+    descriptor: dict[str, Any],
+    session_id: str,
+    account: dict[str, Any],
+    tail: str,
+) -> Any:
+    """Plain-HTTP browsers cannot run the Selkies client; serve noVNC instead.
+
+    Navigable entries redirect inside the same opaque session to the noVNC
+    client, ``vnc*`` routes proxy exactly like native noVNC sessions, and
+    everything else fails closed with an actionable explanation.
+    """
+    if not descriptor_novnc_reconciled(descriptor):
+        return secure_origin_required_response()
+    normalized = tail.strip("/").lower()
+    if normalized in {"", "index.html"}:
+        raise web.HTTPFound(downgraded_novnc_location(session_id))
+    if normalized == "vnc" or normalized.startswith("vnc/"):
+        if str(request.headers.get("Upgrade") or "").lower() == "websocket":
+            return await proxy_websocket(
+                request, downgraded_novnc_descriptor(descriptor), session_id, account, tail
+            )
+        return await proxy_http(
+            request, downgraded_novnc_descriptor(descriptor), session_id, account, tail
+        )
+    return secure_origin_required_response()
 
 
 def selkies_web_root() -> Path:
@@ -683,6 +785,13 @@ async def desktop_handler(request: Any) -> Any:
         descriptor, account = load_session(session_id)
     except GatewaySessionError:
         raise web.HTTPNotFound(text="Desktop session is unavailable")
+    if desktop_provider(descriptor) == "selkies" and not secure_public_origin():
+        # Selkies hard-requires a secure browser origin. Plain-HTTP LAN
+        # browsers must land on the working noVNC client, never on a page
+        # that fails its own secure-context check.
+        return await downgrade_selkies_to_novnc(
+            request, descriptor, session_id, account, tail
+        )
     if str(request.headers.get("Upgrade") or "").lower() == "websocket":
         return await proxy_websocket(request, descriptor, session_id, account, tail)
     if desktop_provider(descriptor) == "selkies" and str(request.method).upper() == "GET":

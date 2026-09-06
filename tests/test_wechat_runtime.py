@@ -560,14 +560,18 @@ class RuntimeRegistryTests(unittest.TestCase):
                 "container_running": True,
                 "agent_server_healthy": True,
             },
-        ), patch.object(
-            manager,
-            "ensure_selkies_desktop",
-            return_value={
-                "desktop_provider": "selkies",
-                "features": dict(agent_wechat_runtime.SELKIES_DESKTOP_FEATURES),
-            },
-        ):
+            ), patch.object(
+                manager,
+                "ensure_selkies_desktop",
+                return_value={
+                    "desktop_provider": "selkies",
+                    "features": dict(agent_wechat_runtime.SELKIES_DESKTOP_FEATURES),
+                },
+            ), patch.object(
+                manager,
+                "ensure_interactive_desktop",
+                return_value={"interactive": True, "action": "interactive"},
+            ):
             desktop = manager.desktop(account)
 
             self.assertEqual(desktop["desktop_provider"], "selkies")
@@ -581,9 +585,11 @@ class RuntimeRegistryTests(unittest.TestCase):
             self.assertFalse(desktop["features"]["clipboard_image"])
             self.assertTrue(desktop["features"]["file_upload"])
             self.assertTrue(desktop["features"]["dynamic_resize"])
+            self.assertTrue(desktop["novnc_reconciled"])
             descriptors = [json.loads(path.read_text(encoding="utf-8")) for path in Path(temp).glob("*.json")]
             self.assertEqual(len(descriptors), 1)
             self.assertEqual(descriptors[0]["desktop_provider"], "selkies")
+            self.assertTrue(descriptors[0]["novnc_reconciled"])
             self.assertNotIn("token", descriptors[0])
 
     def test_desktop_auto_falls_back_to_novnc_without_recreating_old_live_account(self):
@@ -594,6 +600,7 @@ class RuntimeRegistryTests(unittest.TestCase):
             {
                 "WECHAT_DESKTOP_GATEWAY_SESSION_DIR": temp,
                 "WECHAT_SELKIES_ATTACH_ENABLED": "true",
+                "WECHAT_DESKTOP_GATEWAY_PUBLIC_SCHEME": "https",
             },
             clear=False,
         ), patch.object(
@@ -614,10 +621,167 @@ class RuntimeRegistryTests(unittest.TestCase):
             desktop = manager.desktop(account)
 
         self.assertEqual(desktop["desktop_provider"], "novnc")
+        self.assertTrue(desktop["novnc_reconciled"])
         self.assertIn("/vnc/", desktop["path"])
         self.assertIn("restart", desktop["fallback_reason"])
         self.assertFalse(desktop["features"]["local_ime"])
         self.assertFalse(desktop["features"]["file_upload"])
+
+    def test_desktop_auto_selects_novnc_for_http_public_scheme_without_companion(self):
+        manager = agent_wechat_runtime.AgentWechatManager(engine=object())
+        account = {"id": "alpha", "display_name": "Alpha", "runtime_provider": "agent_wechat"}
+
+        def unexpected_selkies(_account):
+            raise AssertionError("HTTP/LAN deployments must not start the Selkies companion")
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ,
+            {
+                "WECHAT_DESKTOP_GATEWAY_SESSION_DIR": temp,
+                "WECHAT_SELKIES_ATTACH_ENABLED": "true",
+                "WECHAT_DESKTOP_GATEWAY_PUBLIC_SCHEME": "http",
+            },
+            clear=False,
+        ), patch.object(
+            manager,
+            "status",
+            return_value={"container_running": True, "agent_server_healthy": True},
+        ), patch.object(
+            manager, "ensure_selkies_desktop", side_effect=unexpected_selkies
+        ), patch.object(
+            manager,
+            "ensure_interactive_desktop",
+            return_value={"interactive": True},
+        ):
+            desktop = manager.desktop(account)
+
+            # The Selkies web client hard-refuses plain-HTTP origins, so auto
+            # on an HTTP/LAN deployment must directly select the working noVNC
+            # client.
+            self.assertEqual(desktop["desktop_provider"], "novnc")
+            self.assertEqual(desktop["scheme"], "http")
+            self.assertTrue(desktop["novnc_reconciled"])
+            self.assertNotIn("fallback_reason", desktop)
+            self.assertIn("/vnc/", desktop["path"])
+            self.assertFalse(desktop["features"]["file_upload"])
+            descriptor = json.loads(
+                next(Path(temp).glob("*.json")).read_text(encoding="utf-8")
+            )
+            self.assertEqual(descriptor["desktop_provider"], "novnc")
+            self.assertTrue(descriptor["novnc_reconciled"])
+
+    def test_desktop_auto_https_keeps_selkies_and_records_novnc_reconciled(self):
+        manager = agent_wechat_runtime.AgentWechatManager(engine=object())
+        account = {"id": "alpha", "display_name": "Alpha", "runtime_provider": "agent_wechat"}
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ,
+            {
+                "WECHAT_DESKTOP_GATEWAY_SESSION_DIR": temp,
+                "WECHAT_SELKIES_ATTACH_ENABLED": "true",
+                "WECHAT_DESKTOP_GATEWAY_PUBLIC_SCHEME": "https",
+            },
+            clear=False,
+        ), patch.object(
+            manager,
+            "status",
+            return_value={"container_running": True, "agent_server_healthy": True},
+        ), patch.object(
+            manager,
+            "ensure_selkies_desktop",
+            return_value={"features": {"mouse": True}},
+        ), patch.object(
+            manager,
+            "ensure_interactive_desktop",
+            return_value={"interactive": True},
+        ) as reconcile:
+            desktop = manager.desktop(account)
+
+            self.assertEqual(desktop["desktop_provider"], "selkies")
+            self.assertTrue(desktop["novnc_reconciled"])
+            self.assertNotIn("fallback_reason", desktop)
+            reconcile.assert_called_once()
+            descriptor = json.loads(
+                next(Path(temp).glob("*.json")).read_text(encoding="utf-8")
+            )
+            self.assertEqual(descriptor["desktop_provider"], "selkies")
+            self.assertTrue(descriptor["novnc_reconciled"])
+
+    def test_desktop_selkies_session_survives_novnc_reconciliation_failure(self):
+        manager = agent_wechat_runtime.AgentWechatManager(engine=object())
+        account = {"id": "alpha", "display_name": "Alpha", "runtime_provider": "agent_wechat"}
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ,
+            {
+                "WECHAT_DESKTOP_GATEWAY_SESSION_DIR": temp,
+                "WECHAT_SELKIES_ATTACH_ENABLED": "true",
+                "WECHAT_DESKTOP_GATEWAY_PUBLIC_SCHEME": "https",
+            },
+            clear=False,
+        ), patch.object(
+            manager,
+            "status",
+            return_value={"container_running": True, "agent_server_healthy": True},
+        ), patch.object(
+            manager,
+            "ensure_selkies_desktop",
+            return_value={"features": {"mouse": True}},
+        ), patch.object(
+            manager,
+            "ensure_interactive_desktop",
+            side_effect=agent_wechat_runtime.AgentWechatRuntimeError("x11vnc missing"),
+        ):
+            desktop = manager.desktop(account)
+
+            # Selkies works without x11vnc; a failed reconciliation only means
+            # the Gateway must fail closed for plain-HTTP browsers on this
+            # session.
+            self.assertEqual(desktop["desktop_provider"], "selkies")
+            self.assertFalse(desktop["novnc_reconciled"])
+            descriptor = json.loads(
+                next(Path(temp).glob("*.json")).read_text(encoding="utf-8")
+            )
+            self.assertFalse(descriptor["novnc_reconciled"])
+
+    def test_desktop_explicit_selkies_fails_closed_for_http_public_scheme(self):
+        manager = agent_wechat_runtime.AgentWechatManager(engine=object())
+        account = {"id": "alpha", "display_name": "Alpha", "runtime_provider": "agent_wechat"}
+
+        def unexpected_selkies(_account):
+            raise AssertionError("explicit Selkies over HTTP must fail before companion start")
+
+        with patch.dict(
+            os.environ,
+            {"WECHAT_DESKTOP_GATEWAY_PUBLIC_SCHEME": "HTTP"},
+            clear=False,
+        ), patch.object(
+            manager,
+            "status",
+            return_value={"container_running": True, "agent_server_healthy": True},
+        ), patch.object(
+            manager, "ensure_selkies_desktop", side_effect=unexpected_selkies
+        ):
+            with self.assertRaisesRegex(
+                agent_wechat_runtime.AgentWechatRuntimeError, "PUBLIC_SCHEME=https"
+            ):
+                manager.desktop(account, desktop_provider="selkies")
+
+    def test_public_gateway_scheme_is_normalized_and_fail_closed(self):
+        for raw, expected in (
+            (None, "http"),
+            ("", "http"),
+            ("https", "https"),
+            ("HTTPS", "https"),
+            ("ftp", "http"),
+        ):
+            with self.subTest(raw=raw):
+                if raw is None:
+                    os.environ.pop("WECHAT_DESKTOP_GATEWAY_PUBLIC_SCHEME", None)
+                else:
+                    os.environ["WECHAT_DESKTOP_GATEWAY_PUBLIC_SCHEME"] = raw
+                try:
+                    self.assertEqual(agent_wechat_runtime.public_gateway_scheme(), expected)
+                finally:
+                    os.environ.pop("WECHAT_DESKTOP_GATEWAY_PUBLIC_SCHEME", None)
 
     def test_selkies_companion_lifecycle_never_creates_a_second_agent_wechat_runtime(self):
         engine = FakeDockerEngine()
@@ -2447,12 +2611,14 @@ class DesktopGatewaySelkiesWebClientTests(unittest.IsolatedAsyncioTestCase):
             self._env_patcher.stop()
             self._env_patcher = None
 
-    def _patch_env(self, web_root: Path | None, fallback_root: Path | None = None):
+    def _patch_env(self, web_root: Path | None, fallback_root: Path | None = None, *, scheme: str | None = "https"):
         env: dict[str, str] = {"WECHAT_GUI_LEASE_DIR": str(self._temp_root / "leases")}
         if web_root is not None:
             env["WECHAT_SELKIES_WEB_ROOT"] = str(web_root)
         if fallback_root is not None:
             env["WECHAT_SELKIES_WEB_FALLBACK_ROOT"] = str(fallback_root)
+        if scheme is not None:
+            env["WECHAT_DESKTOP_GATEWAY_PUBLIC_SCHEME"] = scheme
         self._env_patcher = patch.dict(os.environ, env, clear=False)
         self._env_patcher.start()
 
@@ -2483,6 +2649,7 @@ class DesktopGatewaySelkiesWebClientTests(unittest.IsolatedAsyncioTestCase):
         return {
             "account_id": "alpha",
             "desktop_provider": "selkies",
+            "novnc_reconciled": True,
             "expires_at": int(time.time()) + 600,
         }
 
@@ -2702,6 +2869,144 @@ class DesktopGatewaySelkiesWebClientTests(unittest.IsolatedAsyncioTestCase):
                 response = await client.get("/desktop/opaque-session-1/")
                 self.assertEqual(response.status, 200)
                 self.assertEqual(await response.text(), "proxied:")
+
+    async def test_selkies_session_on_http_origin_redirects_entry_to_novnc_client(self):
+        web_root = self.setUp_web_roots()
+        self._patch_env(web_root, scheme="http")
+        seen: dict = {}
+
+        async def fake_proxy_http(_request, descriptor, _session_id, _account, tail):
+            seen["provider"] = desktop_gateway.desktop_provider(descriptor)
+            seen["descriptor"] = dict(descriptor)
+            seen["tail"] = tail
+            return aio_web.Response(text=f"proxied:{tail}")
+
+        with self._patch_session(), patch.object(
+            desktop_gateway, "proxy_http", side_effect=fake_proxy_http
+        ):
+            async with self._client() as client:
+                # A plain-HTTP browser must land on the working noVNC client,
+                # never on the Selkies bundle that fails its own
+                # secure-context check.
+                response = await client.get(
+                    "/desktop/opaque-session-1/", allow_redirects=False
+                )
+                self.assertEqual(response.status, 302)
+                location = response.headers["Location"]
+                parsed = urllib.parse.urlsplit(location)
+                params = dict(urllib.parse.parse_qsl(parsed.query))
+                self.assertEqual(parsed.path, "/desktop/opaque-session-1/vnc/")
+                self.assertEqual(params.get("autoconnect"), "true")
+                self.assertEqual(
+                    params.get("path"), "desktop/opaque-session-1/vnc/websockify"
+                )
+                self.assertNotIn("token=", location)
+                followed = await client.get(location)
+                self.assertEqual(followed.status, 200)
+                # The raw tail still carries the noVNC client route; the real
+                # proxy maps "vnc/" to upstream's vnc.html (landing_tail).
+                self.assertEqual(await followed.text(), "proxied:vnc/")
+        self.assertEqual(seen["provider"], "novnc")
+        self.assertEqual(seen["descriptor"]["desktop_provider"], "novnc")
+        self.assertTrue(seen["descriptor"]["novnc_reconciled"])
+
+    async def test_selkies_session_on_http_origin_proxies_websocket_vnc_routes(self):
+        web_root = self.setUp_web_roots()
+        self._patch_env(web_root, scheme="http")
+        seen: dict = {}
+
+        async def fake_proxy_websocket(request, descriptor, session_id, account, tail):
+            seen["provider"] = desktop_gateway.desktop_provider(descriptor)
+            seen["tail"] = tail
+            seen["session"] = session_id
+            return aio_web.Response(status=200, text="ws-downgraded")
+
+        with self._patch_session(), patch.object(
+            desktop_gateway, "proxy_websocket", side_effect=fake_proxy_websocket
+        ):
+            async with self._client() as client:
+                response = await client.get(
+                    "/desktop/opaque-session-1/vnc/websockify",
+                    headers={"Upgrade": "websocket", "Connection": "Upgrade"},
+                )
+                self.assertEqual(response.status, 200)
+                self.assertEqual(await response.text(), "ws-downgraded")
+        self.assertEqual(seen["provider"], "novnc")
+        self.assertEqual(seen["tail"], "vnc/websockify")
+        self.assertEqual(seen["session"], "opaque-session-1")
+
+    async def test_selkies_session_on_http_origin_fails_closed_without_reconciliation(self):
+        web_root = self.setUp_web_roots()
+        self._patch_env(web_root, scheme="http")
+        descriptor = self._descriptor()
+        descriptor["novnc_reconciled"] = False
+        token = "d" * 64
+        with patch.object(
+            desktop_gateway,
+            "load_session",
+            return_value=(descriptor, self._account()),
+        ), patch.object(
+            agent_wechat_runtime.AgentWechatManager, "_desktop_token", return_value=token
+        ), patch.object(
+            agent_wechat_runtime.AgentWechatManager, "_token", return_value=token
+        ):
+            async with self._client() as client:
+                for path in (
+                    "/desktop/opaque-session-1/",
+                    "/desktop/opaque-session-1/index.html",
+                    "/desktop/opaque-session-1/src/main.js",
+                    "/desktop/opaque-session-1/vnc/vnc.html",
+                ):
+                    response = await client.get(path)
+                    self.assertEqual(response.status, 503, path)
+                    body = await response.text()
+                    self.assertIn("HTTPS", body)
+                    self.assertNotIn(token, body)
+                    self.assertNotIn("token=", body)
+
+    async def test_selkies_session_on_http_origin_serves_only_vnc_and_entry(self):
+        web_root = self.setUp_web_roots()
+        self._patch_env(web_root, scheme="http")
+        with self._patch_session():
+            async with self._client() as client:
+                # Non-VNC Selkies assets cannot run without a secure origin;
+                # anything else must fail closed instead of proxying.
+                asset = await client.get("/desktop/opaque-session-1/src/main.js")
+                self.assertEqual(asset.status, 503)
+                self.assertIn("HTTPS", await asset.text())
+
+    async def test_selkies_websocket_on_http_origin_rejects_non_vnc_routes(self):
+        web_root = self.setUp_web_roots()
+        self._patch_env(web_root, scheme="http")
+
+        async def unexpected_proxy(*_args, **_kwargs):
+            raise AssertionError("Selkies companion routes must not serve plain-HTTP browsers")
+
+        with self._patch_session(), patch.object(
+            desktop_gateway, "proxy_websocket", side_effect=unexpected_proxy
+        ):
+            async with self._client() as client:
+                with self.assertRaises(aiohttp.WSServerHandshakeError) as ctx:
+                    await client.ws_connect("/desktop/opaque-session-1/websockets")
+                self.assertEqual(ctx.exception.status, 503)
+
+    async def test_public_scheme_env_decides_selkies_serving_or_downgrade(self):
+        web_root = self.setUp_web_roots()
+        with self._patch_session():
+            async with self._client() as client:
+                self._patch_env(web_root, scheme="https")
+                secure = await client.get("/desktop/opaque-session-1/")
+                self.assertEqual(secure.status, 200)
+                self.assertIn("wechat-hub-selkies", await secure.text())
+
+                self._env_patcher.stop()
+                self._env_patcher = None
+                self._patch_env(web_root, scheme="http")
+                insecure = await client.get(
+                    "/desktop/opaque-session-1/", allow_redirects=False
+                )
+                self.assertEqual(insecure.status, 302)
+                self.assertIn("/vnc/?autoconnect=true", insecure.headers["Location"])
 
 
 if __name__ == "__main__":

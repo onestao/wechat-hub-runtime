@@ -63,6 +63,18 @@ SELKIES_DESKTOP_FEATURES = {
 }
 
 
+def public_gateway_scheme() -> str:
+    """Scheme the operator's browser uses to reach the Desktop Gateway.
+
+    The Gateway never terminates TLS itself, so HTTPS is only reachable
+    through a trusted front proxy. Session selection and Gateway serving must
+    agree on this deployment-level declaration; browsers cannot influence it
+    and client-supplied forwarding headers are never trusted.
+    """
+    scheme = os.environ.get("WECHAT_DESKTOP_GATEWAY_PUBLIC_SCHEME", "http").strip().lower()
+    return scheme if scheme in {"http", "https"} else "http"
+
+
 def _selkies_clipboard_enabled() -> bool:
     """rc.2 safety policy: clipboard cannot be re-enabled by configuration.
 
@@ -1805,17 +1817,41 @@ class AgentWechatManager:
         requested_provider = str(desktop_provider or "auto").strip().lower().replace("-", "_")
         if requested_provider not in {"auto", "selkies", "novnc", "no_vnc"}:
             raise AgentWechatRuntimeError("desktop_provider must be auto, selkies, or novnc")
+        public_scheme = public_gateway_scheme()
+        secure_public_origin = public_scheme == "https"
+        if requested_provider == "selkies" and not secure_public_origin:
+            # The Selkies web client hard-refuses plain-HTTP origins, so an
+            # explicit Selkies request over an HTTP/LAN deployment can only
+            # produce a browser page that fails. Fail closed instead of
+            # returning a desktop URL that is known not to work.
+            raise AgentWechatRuntimeError(
+                "desktop_provider=selkies requires WECHAT_DESKTOP_GATEWAY_PUBLIC_SCHEME=https"
+            )
 
         selected_provider = "novnc"
         features = dict(NOVNC_DESKTOP_FEATURES)
         fallback_reason = ""
-        if requested_provider in {"auto", "selkies"} and os.environ.get(
-            "WECHAT_SELKIES_ATTACH_ENABLED", "true"
-        ).strip().lower() not in {"0", "false", "no", "off"}:
+        novnc_reconciled = False
+        if (
+            requested_provider in {"auto", "selkies"}
+            and secure_public_origin
+            and os.environ.get("WECHAT_SELKIES_ATTACH_ENABLED", "true")
+            .strip()
+            .lower()
+            not in {"0", "false", "no", "off"}
+        ):
             try:
                 selkies = self.ensure_selkies_desktop(account)
                 selected_provider = "selkies"
                 features = dict(selkies.get("features") or selkies_desktop_features())
+                # A Selkies session keeps a viable noVNC fallback so the
+                # Gateway can still serve plain-HTTP browsers inside the same
+                # opaque session. Best-effort: Selkies itself does not need it.
+                try:
+                    self.ensure_interactive_desktop(account)
+                    novnc_reconciled = True
+                except AgentWechatRuntimeError:
+                    novnc_reconciled = False
             except AgentWechatRuntimeError as exc:
                 if requested_provider == "selkies":
                     raise
@@ -1823,6 +1859,7 @@ class AgentWechatManager:
 
         if selected_provider == "novnc":
             self.ensure_interactive_desktop(account)
+            novnc_reconciled = True
         session_id = secrets.token_urlsafe(32)
         try:
             ttl = max(60, min(86_400, int(os.environ.get("WECHAT_DESKTOP_GATEWAY_SESSION_TTL", "14400"))))
@@ -1846,6 +1883,7 @@ class AgentWechatManager:
             "account_id": str(account["id"]),
             "runtime_provider": PROVIDER,
             "desktop_provider": selected_provider,
+            "novnc_reconciled": novnc_reconciled,
             "created_at": now,
             "expires_at": now + ttl,
         }
@@ -1859,9 +1897,6 @@ class AgentWechatManager:
             gateway_port = int(os.environ.get("WECHAT_DESKTOP_GATEWAY_PORT", str(DEFAULT_DESKTOP_GATEWAY_PORT)))
         except ValueError:
             gateway_port = DEFAULT_DESKTOP_GATEWAY_PORT
-        public_scheme = os.environ.get("WECHAT_DESKTOP_GATEWAY_PUBLIC_SCHEME", "http").strip().lower()
-        if public_scheme not in {"http", "https"}:
-            public_scheme = "http"
         public_host = os.environ.get("WECHAT_DESKTOP_GATEWAY_PUBLIC_HOST", "").strip()
         public_port_raw = os.environ.get("WECHAT_DESKTOP_GATEWAY_PUBLIC_PORT", "").strip()
         if public_port_raw:
@@ -1885,6 +1920,7 @@ class AgentWechatManager:
             "account_id": account["id"],
             "runtime_provider": PROVIDER,
             "desktop_provider": selected_provider,
+            "novnc_reconciled": novnc_reconciled,
             "scheme": public_scheme,
             "host": public_host,
             "port": public_port,
