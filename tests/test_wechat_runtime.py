@@ -80,16 +80,39 @@ class FakeDockerEngine:
         resolved = self._resolve(identifier)
         return self.containers.get(resolved) if resolved else None
 
-    def managed_containers(self, account_id, *, provider="agent_wechat"):
+    def managed_containers(
+        self,
+        account_id=None,
+        *,
+        instance_uuid=None,
+        resource_key=None,
+        provider="agent_wechat",
+    ):
         rows = []
         for container_id, value in self.containers.items():
             labels = value.get("Config", {}).get("Labels", {})
             if (
                 labels.get("com.wechat-hub.managed") == "true"
-                and labels.get("com.wechat-hub.account-id") == account_id
                 and labels.get("com.wechat-hub.provider") == provider
             ):
-                rows.append({"Id": container_id, "Labels": labels})
+                if instance_uuid and labels.get("com.wechat-hub.instance-uuid") == instance_uuid:
+                    rows.append({"Id": container_id, "Labels": labels})
+                elif not instance_uuid and account_id and labels.get("com.wechat-hub.account-id") == account_id:
+                    rows.append({"Id": container_id, "Labels": labels})
+        if not rows and instance_uuid:
+            for cand in [account_id, resource_key]:
+                if not cand:
+                    continue
+                for container_id, value in self.containers.items():
+                    labels = value.get("Config", {}).get("Labels", {})
+                    if (
+                        labels.get("com.wechat-hub.managed") == "true"
+                        and labels.get("com.wechat-hub.provider") == provider
+                        and labels.get("com.wechat-hub.account-id") == cand
+                    ):
+                        rows.append({"Id": container_id, "Labels": labels})
+                if rows:
+                    break
         return rows
 
     def create_volume(self, name, device, labels):
@@ -3007,6 +3030,485 @@ class DesktopGatewaySelkiesWebClientTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(insecure.status, 302)
                 self.assertIn("/vnc/?autoconnect=true", insecure.headers["Location"])
+
+
+
+
+class IdentityV2RuntimeTests(unittest.TestCase):
+    def make_paths(self, root: Path):
+        return wechat_runtime.RuntimePaths(
+            registry_file=root / "config" / "wechat-runtime" / "accounts.json",
+            account_home_root=root / "config" / "wechat-accounts",
+            runtime_dir=root / "run" / "wechat-runtime",
+        )
+
+    def test_a8_01_legacy_registry_migration(self):
+        """1. Legacy registry migration: v1 schema automatically upgrades to v2 with UUID, alias, and resource_key."""
+        with tempfile.TemporaryDirectory() as temp:
+            paths = self.make_paths(Path(temp))
+            paths.registry_file.parent.mkdir(parents=True, exist_ok=True)
+            v1_data = {
+                "version": 1,
+                "accounts": [
+                    {
+                        "id": "work",
+                        "display_name": "Work Account",
+                        "username": "agent_work",
+                        "uid": None,
+                        "display": "isolated",
+                        "home": "/config/agent-wechat/work/home",
+                        "enabled": True,
+                        "autostart": True,
+                        "legacy": False,
+                        "runtime_provider": "agent_wechat",
+                        "agent_wechat": {
+                            "container_name": "wechat-agent-work",
+                            "data_volume": "wechat-agent-work-data",
+                            "home_volume": "wechat-agent-work-home",
+                            "token_file": "/config/agent-wechat/work/auth-token",
+                        },
+                    },
+                    {
+                        "id": "personal",
+                        "username": "wx_personal",
+                        "uid": 20001,
+                        "display": ":1",
+                        "home": "/config/wechat-accounts/personal/home",
+                        "enabled": True,
+                        "autostart": False,
+                        "legacy": False,
+                        "runtime_provider": "legacy",
+                    },
+                ],
+            }
+            paths.registry_file.write_text(json.dumps(v1_data), encoding="utf-8")
+
+            registry = wechat_runtime.Registry(paths)
+            data = registry.load()
+
+            self.assertEqual(data["version"], 2)
+            self.assertEqual(len(data["accounts"]), 2)
+
+            acc0 = data["accounts"][0]
+            self.assertTrue(bool(acc0.get("instance_uuid")))
+            self.assertEqual(acc0["instance_uuid"], wechat_runtime.validate_instance_uuid(acc0["instance_uuid"]))
+            self.assertEqual(acc0["runtime_alias"], "work")
+            self.assertEqual(acc0["id"], "work")
+            self.assertEqual(acc0["display_name"], "Work Account")
+            self.assertEqual(acc0["resource_key"], "work")
+            self.assertEqual(acc0["runtime_provider"], "agent_wechat")
+            self.assertEqual(acc0["agent_wechat"]["container_name"], "wechat-agent-work")
+
+            acc1 = data["accounts"][1]
+            self.assertTrue(bool(acc1.get("instance_uuid")))
+            self.assertEqual(acc1["instance_uuid"], wechat_runtime.validate_instance_uuid(acc1["instance_uuid"]))
+            self.assertEqual(acc1["runtime_alias"], "personal")
+            self.assertEqual(acc1["id"], "personal")
+            self.assertEqual(acc1["display_name"], "personal")
+            self.assertEqual(acc1["resource_key"], wechat_runtime.sanitize_account_runtime_name("personal"))
+            self.assertEqual(acc1["runtime_provider"], "legacy")
+
+            # Check file on disk is migrated
+            disk_data = json.loads(paths.registry_file.read_text(encoding="utf-8"))
+            self.assertEqual(disk_data["version"], 2)
+            self.assertEqual(disk_data["accounts"][0]["instance_uuid"], acc0["instance_uuid"])
+
+    def test_a8_02_uuid_persistence(self):
+        """2. UUID persistence: once generated, UUID never changes across reloads or saves."""
+        with tempfile.TemporaryDirectory() as temp:
+            paths = self.make_paths(Path(temp))
+            paths.registry_file.parent.mkdir(parents=True, exist_ok=True)
+            v1_data = {
+                "version": 1,
+                "accounts": [
+                    {
+                        "id": "persisted",
+                        "username": "agent_persisted",
+                        "uid": None,
+                        "display": "isolated",
+                        "home": "/config/agent-wechat/persisted/home",
+                        "runtime_provider": "agent_wechat",
+                    }
+                ],
+            }
+            paths.registry_file.write_text(json.dumps(v1_data), encoding="utf-8")
+
+            reg1 = wechat_runtime.Registry(paths)
+            data1 = reg1.load()
+            uuid1 = data1["accounts"][0]["instance_uuid"]
+            res_key1 = data1["accounts"][0]["resource_key"]
+
+            reg2 = wechat_runtime.Registry(paths)
+            data2 = reg2.load()
+            self.assertEqual(data2["accounts"][0]["instance_uuid"], uuid1)
+            self.assertEqual(data2["accounts"][0]["resource_key"], res_key1)
+
+            reg2.save(data2)
+            reg3 = wechat_runtime.Registry(paths)
+            data3 = reg3.load()
+            self.assertEqual(data3["accounts"][0]["instance_uuid"], uuid1)
+            self.assertEqual(data3["accounts"][0]["resource_key"], res_key1)
+
+    def test_a8_03_duplicate_uuid_rejected(self):
+        """3. Duplicate UUID rejected: save or register with existing UUID raises error."""
+        with tempfile.TemporaryDirectory() as temp:
+            paths = self.make_paths(Path(temp))
+            registry = wechat_runtime.Registry(paths)
+            with patch.object(wechat_runtime, "require_root"):
+                acc1 = wechat_runtime.register_account(
+                    registry, "acc1", "Account 1", False, provider="agent_wechat"
+                )
+                existing_uuid = acc1["instance_uuid"]
+
+                # Registering with the same UUID must fail
+                with self.assertRaises(wechat_runtime.RuntimeErrorWithHint) as ctx:
+                    wechat_runtime.register_account(
+                        registry, "acc2", "Account 2", False, instance_uuid=existing_uuid, provider="agent_wechat"
+                    )
+                self.assertIn("instance_uuid already exists", str(ctx.exception))
+
+                # Invalid UUID format must fail
+                with self.assertRaises(ValueError) as ctx2:
+                    wechat_runtime.register_account(
+                        registry, "acc3", "Account 3", False, instance_uuid="invalid-uuid-format", provider="agent_wechat"
+                    )
+                self.assertIn("invalid instance_uuid", str(ctx2.exception))
+
+                # Direct duplicate UUID in registry data must fail validation on save
+                data = registry.load()
+                dup_account = dict(data["accounts"][0])
+                dup_account["runtime_alias"] = "acc_other"
+                dup_account["id"] = "acc_other"
+                dup_account["username"] = "agent_acc_other"
+                dup_account["resource_key"] = "acc-other-key"
+                data["accounts"].append(dup_account)
+                with self.assertRaises(wechat_runtime.RuntimeErrorWithHint) as ctx3:
+                    registry.save(data)
+                self.assertIn("duplicate instance_uuid", str(ctx3.exception))
+
+    def test_a8_04_alias_rename_does_not_change_resource_key(self):
+        """4. Alias rename doesn't change resource_key, volumes, container names, or token path."""
+        with tempfile.TemporaryDirectory() as temp:
+            paths = self.make_paths(Path(temp))
+            registry = wechat_runtime.Registry(paths)
+            with patch.object(wechat_runtime, "require_root"):
+                acc = wechat_runtime.register_account(
+                    registry, "initial_alias", "Initial Display", False, provider="agent_wechat"
+                )
+                orig_uuid = acc["instance_uuid"]
+                orig_res_key = acc["resource_key"]
+                orig_cname = agent_wechat_runtime.AgentWechatManager.container_name(acc)
+                orig_dcname = agent_wechat_runtime.AgentWechatManager.desktop_container_name(acc)
+                orig_storage = agent_wechat_runtime.AgentWechatManager.storage_names(acc)
+                orig_dstorage = agent_wechat_runtime.AgentWechatManager.desktop_storage_names(acc)
+                orig_token = acc["agent_wechat"]["token_file"]
+
+                updated = wechat_runtime.update_account(
+                    registry,
+                    "initial_alias",
+                    runtime_alias="renamed_alias",
+                    display_name="Renamed Display",
+                )
+
+                self.assertEqual(updated["instance_uuid"], orig_uuid)
+                self.assertEqual(updated["runtime_alias"], "renamed_alias")
+                self.assertEqual(updated["display_name"], "Renamed Display")
+                self.assertEqual(updated["id"], "renamed_alias")
+                self.assertEqual(updated["resource_key"], orig_res_key)
+
+                # Physical resources must be strictly identical
+                self.assertEqual(agent_wechat_runtime.AgentWechatManager.container_name(updated), orig_cname)
+                self.assertEqual(agent_wechat_runtime.AgentWechatManager.desktop_container_name(updated), orig_dcname)
+                self.assertEqual(agent_wechat_runtime.AgentWechatManager.storage_names(updated), orig_storage)
+                self.assertEqual(agent_wechat_runtime.AgentWechatManager.desktop_storage_names(updated), orig_dstorage)
+                self.assertEqual(updated["agent_wechat"]["token_file"], orig_token)
+
+    def test_a8_05_existing_agent_wechat_storage_lookup_still_works(self):
+        """5. Existing agent-wechat storage lookup still works without creating empty volumes."""
+        legacy_account = {
+            "id": "legacy_work",
+            "runtime_alias": "legacy_work",
+            "display_name": "Legacy Work",
+            "runtime_provider": "agent_wechat",
+            "agent_wechat": {
+                "container_name": "wechat-agent-custom_name_123",
+                "data_volume": "wechat-agent-custom_name_123-data",
+                "home_volume": "wechat-agent-custom_name_123-home",
+                "token_file": "/config/agent-wechat/custom_name_123/auth-token",
+            },
+        }
+        derived_key = wechat_runtime.derive_legacy_resource_key(legacy_account)
+        self.assertEqual(derived_key, "custom_name_123")
+
+        cname = agent_wechat_runtime.AgentWechatManager.container_name(legacy_account)
+        self.assertEqual(cname, "wechat-agent-custom_name_123")
+        storage = agent_wechat_runtime.AgentWechatManager.storage_names(legacy_account)
+        self.assertEqual(storage, ("wechat-agent-custom_name_123-data", "wechat-agent-custom_name_123-home"))
+
+    def test_a8_06_container_labels_carry_uuid_and_alias_resilience(self):
+        """6. Container labels carry instance_uuid, runtime_alias, resource_key; validation is resilient to rename."""
+        account = {
+            "instance_uuid": "11111111-2222-3333-4444-555555555555",
+            "runtime_alias": "my_alias",
+            "id": "my_alias",
+            "display_name": "My Display",
+            "resource_key": "my-res-key",
+            "runtime_provider": "agent_wechat",
+        }
+        labels = agent_wechat_runtime._labels(account)
+        self.assertEqual(labels["com.wechat-hub.managed"], "true")
+        self.assertEqual(labels["com.wechat-hub.instance-uuid"], "11111111-2222-3333-4444-555555555555")
+        self.assertEqual(labels["com.wechat-hub.runtime-alias"], "my_alias")
+        self.assertEqual(labels["com.wechat-hub.resource-key"], "my-res-key")
+        self.assertEqual(labels["com.wechat-hub.account-id"], "my_alias")
+        self.assertEqual(labels["com.wechat-hub.provider"], "agent_wechat")
+
+        d_labels = agent_wechat_runtime.AgentWechatManager._desktop_labels(account, "parent-con-123")
+        self.assertEqual(d_labels["com.wechat-hub.instance-uuid"], "11111111-2222-3333-4444-555555555555")
+        self.assertEqual(d_labels["com.wechat-hub.runtime-alias"], "my_alias")
+        self.assertEqual(d_labels["com.wechat-hub.resource-key"], "my-res-key")
+        self.assertEqual(d_labels["com.wechat-hub.desktop-provider"], "selkies")
+        self.assertEqual(d_labels["com.wechat-hub.parent-container"], "parent-con-123")
+
+        # Validation survives alias rename
+        renamed_account = dict(account)
+        renamed_account["runtime_alias"] = "brand_new_alias"
+        renamed_account["id"] = "brand_new_alias"
+
+        inspected = {
+            "Id": "container-xyz",
+            "Config": {"Labels": labels},
+        }
+        validated_id = agent_wechat_runtime.AgentWechatManager._validate_managed_container(renamed_account, inspected)
+        self.assertEqual(validated_id, "container-xyz")
+
+        # Validation fails if instance_uuid conflicts
+        conflicting_account = dict(account)
+        conflicting_account["instance_uuid"] = "99999999-8888-7777-6666-555555555555"
+        with self.assertRaises(agent_wechat_runtime.AgentWechatRuntimeError):
+            agent_wechat_runtime.AgentWechatManager._validate_managed_container(conflicting_account, inspected)
+
+    def test_a8_07_login_status_returns_logged_in_user_and_identity_observed_at(self):
+        """7. Login status returns logged_in_user, RFC3339 identity_observed_at, and identity v2 fields."""
+        account = {
+            "instance_uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "runtime_alias": "logged_in_acc",
+            "id": "logged_in_acc",
+            "display_name": "Logged In User",
+            "resource_key": "logged-res",
+            "runtime_provider": "agent_wechat",
+        }
+        manager = agent_wechat_runtime.AgentWechatManager(engine=FakeDockerEngine())
+        with patch.object(
+            manager,
+            "status",
+            return_value={
+                "container_running": True,
+                "agent_server_healthy": True,
+                "runtime_health": "healthy",
+                "wechat_login_status": "logged_in",
+                "logged_in_user": "wxid_real_observer_001",
+                "container_id": "c-123",
+            },
+        ):
+            login = manager.login_status(account)
+
+        self.assertEqual(login["logged_in_user"], "wxid_real_observer_001")
+        self.assertEqual(login["auth_status"], "logged_in")
+        self.assertEqual(login["instance_uuid"], "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        self.assertEqual(login["runtime_alias"], "logged_in_acc")
+        self.assertEqual(login["account_id"], "logged_in_acc")
+        self.assertEqual(login["resource_key"], "logged-res")
+        self.assertTrue(bool(login["identity_observed_at"]))
+        self.assertRegex(login["identity_observed_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+    def test_a8_08_profile_absent_safe_fallback(self):
+        """8. Profile absent safe fallback: empty nickname/avatar_url, never spoofed with display_name."""
+        account = {
+            "instance_uuid": "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+            "runtime_alias": "profile_acc",
+            "id": "profile_acc",
+            "display_name": "Friendly Display Name",
+            "resource_key": "prof-res",
+            "runtime_provider": "agent_wechat",
+        }
+        manager = agent_wechat_runtime.AgentWechatManager(engine=FakeDockerEngine())
+        with patch.object(
+            manager,
+            "status",
+            return_value={
+                "container_running": True,
+                "agent_server_healthy": True,
+                "runtime_health": "healthy",
+                "wechat_login_status": "logged_in",
+                "logged_in_user": "wxid_no_profile_api",
+                "container_id": "c-456",
+            },
+        ):
+            login = manager.login_status(account)
+
+        profile = login.get("wechat_profile")
+        self.assertIsInstance(profile, dict)
+        self.assertEqual(profile["wechat_user_id"], "wxid_no_profile_api")
+        self.assertEqual(profile["nickname"], "")
+        self.assertEqual(profile["avatar_url"], "")
+        # MUST NEVER spoof nickname with display_name
+        self.assertNotEqual(profile["nickname"], account["display_name"])
+
+        # When stopped/unauthenticated, profile and observed_at are None
+        with patch.object(
+            manager,
+            "status",
+            return_value={
+                "container_running": False,
+                "agent_server_healthy": None,
+                "runtime_health": "stopped",
+                "wechat_login_status": "stopped",
+                "logged_in_user": "",
+            },
+        ):
+            logged_out = manager.login_status(account)
+        self.assertIsNone(logged_out["wechat_profile"])
+        self.assertIsNone(logged_out["identity_observed_at"])
+
+    def test_a8_09_unregister_by_canonical_instance_reference(self):
+        """9. Unregister by canonical instance reference: unregister using instance_uuid."""
+        with tempfile.TemporaryDirectory() as temp:
+            paths = self.make_paths(Path(temp))
+            registry = wechat_runtime.Registry(paths)
+            with patch.object(wechat_runtime, "require_root"):
+                acc = wechat_runtime.register_account(
+                    registry, "canonical_unreg", "Unreg Me", False, provider="agent_wechat"
+                )
+                target_uuid = acc["instance_uuid"]
+                initial_count = len(registry.load()["accounts"])
+
+                # Unregister by instance_uuid
+                with patch.object(
+                    agent_wechat_runtime.AgentWechatManager,
+                    "remove",
+                    return_value={"removed": "canonical_unreg", "instance_uuid": target_uuid},
+                ):
+                    removal = wechat_runtime.unregister_account(registry, target_uuid)
+
+                self.assertEqual(removal["instance_uuid"], target_uuid)
+                data = registry.load()
+                self.assertEqual(len(data["accounts"]), initial_count - 1)
+
+                with self.assertRaises(wechat_runtime.RuntimeErrorWithHint):
+                    wechat_runtime.find_account(data, target_uuid)
+
+    def test_a8_10_old_account_id_compatibility_remains(self):
+        """10. Old account_id compatibility remains for find, status, login_status, dispatch_action, and update."""
+        with tempfile.TemporaryDirectory() as temp:
+            paths = self.make_paths(Path(temp))
+            registry = wechat_runtime.Registry(paths)
+            with patch.object(wechat_runtime, "require_root"):
+                acc = wechat_runtime.register_account(
+                    registry, "compat_account", "Compat", False, provider="agent_wechat"
+                )
+                data = registry.load()
+
+                # 1. find_account works by legacy account_id
+                found = wechat_runtime.find_account(data, "compat_account")
+                self.assertEqual(found["instance_uuid"], acc["instance_uuid"])
+
+                # 2. status_for returns account_id
+                with patch.object(
+                    agent_wechat_runtime.AgentWechatManager,
+                    "status",
+                    return_value={
+                        "instance_uuid": acc["instance_uuid"],
+                        "runtime_alias": "compat_account",
+                        "account_id": "compat_account",
+                        "display_name": "Compat",
+                        "resource_key": acc["resource_key"],
+                        "container_id": "c-test",
+                        "runtime_provider": "agent_wechat",
+                        "running": False,
+                    },
+                ):
+                    status = wechat_runtime.status_for(found)
+                    self.assertEqual(status["account_id"], "compat_account")
+                    self.assertEqual(status["runtime_alias"], "compat_account")
+
+                # 3. login_status_for returns account_id
+                with patch.object(
+                    agent_wechat_runtime.AgentWechatManager,
+                    "login_status",
+                    return_value={
+                        "instance_uuid": acc["instance_uuid"],
+                        "runtime_alias": "compat_account",
+                        "account_id": "compat_account",
+                        "display_name": "Compat",
+                        "resource_key": acc["resource_key"],
+                        "container_id": "c-test",
+                        "runtime_provider": "agent_wechat",
+                        "running": False,
+                    },
+                ):
+                    login = wechat_runtime_control.login_status_for(found)
+                    self.assertEqual(login["account_id"], "compat_account")
+
+                # 4. dispatch_action with account_id for update
+                res = wechat_runtime_control.dispatch_action(
+                    registry,
+                    {
+                        "action": "update",
+                        "account_id": "compat_account",
+                        "display_name": "Updated via Control",
+                    },
+                )
+                self.assertEqual(res["account"]["display_name"], "Updated via Control")
+
+                # 5. dispatch_action with instance_uuid for update
+                res2 = wechat_runtime_control.dispatch_action(
+                    registry,
+                    {
+                        "action": "update",
+                        "instance_uuid": acc["instance_uuid"],
+                        "display_name": "Updated via UUID",
+                    },
+                )
+                self.assertEqual(res2["account"]["display_name"], "Updated via UUID")
+
+    def test_a8_11_alias_rename_via_control_action_is_fail_closed(self):
+        """11. Alias rename requests via control action or CLI are fail-closed in this release (P0-I2, Gate F8)."""
+        with tempfile.TemporaryDirectory() as temp:
+            paths = self.make_paths(Path(temp))
+            registry = wechat_runtime.Registry(paths)
+            with patch.object(wechat_runtime, "require_root"):
+                acc = wechat_runtime.register_account(
+                    registry, "account_f8", "Original Display", False, provider="agent_wechat"
+                )
+                orig_uuid = acc["instance_uuid"]
+                orig_res_key = acc["resource_key"]
+
+                # 1. Alias rename via dispatch_action must raise RuntimeErrorWithHint
+                with self.assertRaises(wechat_runtime.RuntimeErrorWithHint) as ctx:
+                    wechat_runtime_control.dispatch_action(
+                        registry,
+                        {
+                            "action": "update",
+                            "account_id": "account_f8",
+                            "runtime_alias": "renamed_f8",
+                        },
+                    )
+                self.assertIn("runtime_alias rename is deferred in this release", str(ctx.exception))
+
+                # 2. Same alias or None with display_name update succeeds
+                res = wechat_runtime_control.dispatch_action(
+                    registry,
+                    {
+                        "action": "update",
+                        "account_id": "account_f8",
+                        "runtime_alias": "account_f8",
+                        "display_name": "Allowed Display Update",
+                    },
+                )
+                self.assertEqual(res["account"]["display_name"], "Allowed Display Update")
+                self.assertEqual(res["account"]["instance_uuid"], orig_uuid)
+                self.assertEqual(res["account"]["resource_key"], orig_res_key)
 
 
 if __name__ == "__main__":

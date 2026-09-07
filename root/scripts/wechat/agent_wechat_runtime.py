@@ -23,6 +23,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,9 @@ DEFAULT_DESKTOP_GATEWAY_PORT = 17892
 SELKIES_ATTACH_PORT = 8081
 MANAGED_LABEL = "com.wechat-hub.managed"
 ACCOUNT_LABEL = "com.wechat-hub.account-id"
+INSTANCE_UUID_LABEL = "com.wechat-hub.instance-uuid"
+RUNTIME_ALIAS_LABEL = "com.wechat-hub.runtime-alias"
+RESOURCE_KEY_LABEL = "com.wechat-hub.resource-key"
 
 logger = logging.getLogger("agent_wechat_runtime")
 PROVIDER_LABEL = "com.wechat-hub.provider"
@@ -281,11 +285,18 @@ _LOGIN_FLOWS: dict[str, dict[str, Any]] = {}
 _LOGIN_FLOWS_LOCK = threading.Lock()
 
 
-def _clear_login_flow(account_id: str) -> None:
+def _clear_login_flow(identifier: str) -> None:
     """Forget one account's ephemeral login state without touching persisted data."""
 
     with _LOGIN_FLOWS_LOCK:
-        flow = _LOGIN_FLOWS.pop(account_id, None)
+        flow = _LOGIN_FLOWS.pop(identifier, None)
+        for k, v in list(_LOGIN_FLOWS.items()):
+            if isinstance(v, dict) and identifier in {
+                str(v.get("account_id") or ""),
+                str(v.get("instance_uuid") or ""),
+                str(v.get("runtime_alias") or ""),
+            }:
+                _LOGIN_FLOWS.pop(k, None)
     if not flow:
         return
     lock = flow.get("lock")
@@ -296,7 +307,7 @@ def _clear_login_flow(account_id: str) -> None:
         flow["state"] = "discarded"
 
 
-def _clear_desktop_sessions(account_id: str) -> None:
+def _clear_desktop_sessions(identifier: str) -> None:
     """Revoke all opaque browser gateway sessions for one account."""
 
     root = Path(
@@ -309,8 +320,15 @@ def _clear_desktop_sessions(account_id: str) -> None:
             value = json.loads(candidate.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(value, dict) and str(value.get("account_id") or "") == account_id:
-            candidate.unlink(missing_ok=True)
+        if isinstance(value, dict):
+            matched = identifier in {
+                str(value.get("account_id") or ""),
+                str(value.get("instance_uuid") or ""),
+                str(value.get("runtime_alias") or ""),
+                str(value.get("resource_key") or ""),
+            }
+            if matched:
+                candidate.unlink(missing_ok=True)
 
 
 class AgentWechatRuntimeError(RuntimeError):
@@ -404,20 +422,38 @@ class DockerEngine:
             raise
         return value if isinstance(value, dict) else None
 
-    def managed_containers(self, account_id: str, *, provider: str = PROVIDER) -> list[dict[str, Any]]:
-        filters = json.dumps(
-            {
-                "label": [
-                    f"{MANAGED_LABEL}=true",
-                    f"{ACCOUNT_LABEL}={account_id}",
-                    f"{PROVIDER_LABEL}={provider}",
-                ]
-            },
-            separators=(",", ":"),
-        )
+    def managed_containers(
+        self,
+        account_id: str | None = None,
+        *,
+        instance_uuid: str | None = None,
+        resource_key: str | None = None,
+        provider: str = PROVIDER,
+    ) -> list[dict[str, Any]]:
+        labels = [f"{MANAGED_LABEL}=true", f"{PROVIDER_LABEL}={provider}"]
+        if instance_uuid:
+            labels.append(f"{INSTANCE_UUID_LABEL}={instance_uuid}")
+        elif account_id:
+            labels.append(f"{ACCOUNT_LABEL}={account_id}")
+        filters = json.dumps({"label": labels}, separators=(",", ":"))
         query = urllib.parse.urlencode({"all": "1", "filters": filters})
         value = self.request("GET", f"/containers/json?{query}", expected=(200,))
-        return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+        rows = [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+        if not rows and instance_uuid:
+            # Fallback for legacy containers labeled before instance_uuid was introduced
+            candidates = [c for c in (account_id, resource_key) if c]
+            for cand in candidates:
+                legacy_filters = json.dumps(
+                    {"label": [f"{MANAGED_LABEL}=true", f"{ACCOUNT_LABEL}={cand}", f"{PROVIDER_LABEL}={provider}"]},
+                    separators=(",", ":"),
+                )
+                q = urllib.parse.urlencode({"all": "1", "filters": legacy_filters})
+                val = self.request("GET", f"/containers/json?{q}", expected=(200,))
+                matched = [item for item in val if isinstance(item, dict)] if isinstance(val, list) else []
+                if matched:
+                    rows = matched
+                    break
+        return rows
 
     def create_volume(self, name: str, device: str, labels: dict[str, str]) -> None:
         payload = {
@@ -557,12 +593,31 @@ def _docker_stream_payload(data: bytes) -> bytes:
     return b"".join(chunks) if framed else data
 
 
-def _labels(account_id: str) -> dict[str, str]:
-    return {
+def _labels(account_or_id: dict[str, Any] | str) -> dict[str, str]:
+    if isinstance(account_or_id, dict):
+        account = account_or_id
+        alias = str(account.get("runtime_alias") or account.get("id") or "")
+        uuid_val = str(account.get("instance_uuid") or "")
+        res_key = str(account.get("resource_key") or "")
+        provider_val = str(account.get("runtime_provider") or PROVIDER)
+    else:
+        alias = str(account_or_id)
+        uuid_val = ""
+        res_key = ""
+        provider_val = PROVIDER
+
+    labels = {
         MANAGED_LABEL: "true",
-        ACCOUNT_LABEL: account_id,
-        PROVIDER_LABEL: PROVIDER,
+        ACCOUNT_LABEL: alias,
+        PROVIDER_LABEL: provider_val,
     }
+    if uuid_val:
+        labels[INSTANCE_UUID_LABEL] = uuid_val
+    if alias:
+        labels[RUNTIME_ALIAS_LABEL] = alias
+    if res_key:
+        labels[RESOURCE_KEY_LABEL] = res_key
+    return labels
 
 
 def _decode_data_url(value: str) -> bytes:
@@ -589,18 +644,33 @@ class AgentWechatManager:
 
     @staticmethod
     def container_name(account: dict[str, Any]) -> str:
+        aw = account.get("agent_wechat")
+        if isinstance(aw, dict) and aw.get("container_name"):
+            return str(aw["container_name"])
+        res_key = account.get("resource_key")
+        if res_key:
+            return f"wechat-agent-{res_key}"
         from wechat_runtime import sanitize_account_runtime_name
 
-        return f"wechat-agent-{sanitize_account_runtime_name(str(account['id']))}"
+        return f"wechat-agent-{sanitize_account_runtime_name(str(account.get('runtime_alias') or account['id']))}"
 
     @staticmethod
     def desktop_container_name(account: dict[str, Any]) -> str:
-        from wechat_runtime import sanitize_account_runtime_name
-
-        return f"wechat-desktop-{sanitize_account_runtime_name(str(account['id']))}"
+        res_key = account.get("resource_key")
+        if not res_key:
+            aw = account.get("agent_wechat")
+            if isinstance(aw, dict) and aw.get("container_name"):
+                res_key = str(aw["container_name"]).removeprefix("wechat-agent-")
+        if not res_key:
+            from wechat_runtime import sanitize_account_runtime_name
+            res_key = sanitize_account_runtime_name(str(account.get("runtime_alias") or account["id"]))
+        return f"wechat-desktop-{res_key}"
 
     @staticmethod
     def storage_names(account: dict[str, Any]) -> tuple[str, str]:
+        aw = account.get("agent_wechat")
+        if isinstance(aw, dict) and aw.get("data_volume") and aw.get("home_volume"):
+            return str(aw["data_volume"]), str(aw["home_volume"])
         safe = AgentWechatManager.container_name(account).removeprefix("wechat-agent-")
         return f"wechat-agent-{safe}-data", f"wechat-agent-{safe}-home"
 
@@ -690,7 +760,7 @@ class AgentWechatManager:
     def _ensure_volumes(self, account: dict[str, Any], host_config_root: str) -> tuple[str, str, str]:
         files = self.prepare_files(account)
         data_volume, home_volume = self.storage_names(account)
-        labels = _labels(str(account["id"]))
+        labels = _labels(account)
         rel_root = Path(files["root"]).relative_to("/config")
         host_root = Path(host_config_root) / rel_root
         self.engine.create_volume(data_volume, str(host_root / "data"), labels)
@@ -701,7 +771,7 @@ class AgentWechatManager:
     def _ensure_desktop_volumes(self, account: dict[str, Any], host_config_root: str) -> tuple[str, str]:
         files = self.prepare_files(account)
         x11_volume, browser_files_volume = self.desktop_storage_names(account)
-        labels = _labels(str(account["id"]))
+        labels = _labels(account)
         labels[DESKTOP_PROVIDER_LABEL] = "selkies"
         rel_root = Path(files["root"]).relative_to("/config")
         host_root = Path(host_config_root) / rel_root
@@ -731,11 +801,33 @@ class AgentWechatManager:
         rel_root = Path(files["root"]).relative_to("/config")
         return str(Path(host_config_root) / rel_root / "desktop-auth-token")
 
+    def _find_engine_containers(self, account: dict[str, Any], *, provider: str) -> list[dict[str, Any]]:
+        acc_id = str(account.get("id") or account.get("runtime_alias") or "")
+        uuid_val = str(account.get("instance_uuid") or "")
+        res_key = str(account.get("resource_key") or "")
+        try:
+            return self.engine.managed_containers(
+                acc_id,
+                instance_uuid=uuid_val or None,
+                resource_key=res_key or None,
+                provider=provider,
+            )
+        except TypeError:
+            try:
+                return self.engine.managed_containers(
+                    acc_id,
+                    instance_uuid=uuid_val or None,
+                    provider=provider,
+                )
+            except TypeError:
+                return self.engine.managed_containers(acc_id, provider=provider)
+
     def _find_container(self, account: dict[str, Any]) -> dict[str, Any] | None:
-        matches = self.engine.managed_containers(str(account["id"]))
+        matches = self._find_engine_containers(account, provider=PROVIDER)
         if len(matches) > 1:
+            alias = account.get("runtime_alias") or account.get("id")
             raise AgentWechatRuntimeError(
-                f"multiple managed agent-wechat containers found for account {account['id']}; refusing ambiguous control"
+                f"multiple managed agent-wechat containers found for account {alias}; refusing ambiguous control"
             )
         if not matches:
             return None
@@ -743,10 +835,11 @@ class AgentWechatManager:
         return self.engine.inspect_container(identifier) if identifier else None
 
     def _find_desktop_container(self, account: dict[str, Any]) -> dict[str, Any] | None:
-        matches = self.engine.managed_containers(str(account["id"]), provider=SELKIES_PROVIDER)
+        matches = self._find_engine_containers(account, provider=SELKIES_PROVIDER)
         if len(matches) > 1:
+            alias = account.get("runtime_alias") or account.get("id")
             raise AgentWechatRuntimeError(
-                f"multiple managed Selkies desktop containers found for account {account['id']}; refusing ambiguous control"
+                f"multiple managed Selkies desktop containers found for account {alias}; refusing ambiguous control"
             )
         if not matches:
             return None
@@ -775,13 +868,23 @@ class AgentWechatManager:
 
     @staticmethod
     def _desktop_labels(account: dict[str, Any], parent_container_id: str) -> dict[str, str]:
-        return {
+        alias = str(account.get("runtime_alias") or account.get("id") or "")
+        uuid_val = str(account.get("instance_uuid") or "")
+        res_key = str(account.get("resource_key") or "")
+        labels = {
             MANAGED_LABEL: "true",
-            ACCOUNT_LABEL: str(account["id"]),
+            ACCOUNT_LABEL: alias,
             PROVIDER_LABEL: SELKIES_PROVIDER,
             DESKTOP_PROVIDER_LABEL: "selkies",
             PARENT_CONTAINER_LABEL: parent_container_id,
         }
+        if uuid_val:
+            labels[INSTANCE_UUID_LABEL] = uuid_val
+        if alias:
+            labels[RUNTIME_ALIAS_LABEL] = alias
+        if res_key:
+            labels[RESOURCE_KEY_LABEL] = res_key
+        return labels
 
     def selkies_image_for(self) -> str:
         configured = os.environ.get("WECHAT_SELKIES_ATTACH_IMAGE", "").strip()
@@ -1050,7 +1153,7 @@ class AgentWechatManager:
             shm_size = max(64, int(os.environ.get("AGENT_WECHAT_SHM_MB", "512"))) * 1024 * 1024
         except ValueError:
             shm_size = 512 * 1024 * 1024
-        labels = _labels(str(account["id"]))
+        labels = _labels(account)
         labels["com.wechat-hub.image"] = self.image_for(account)
         mounts = [
             {"Type": "volume", "Source": data_volume, "Target": "/data"},
@@ -1134,9 +1237,16 @@ class AgentWechatManager:
     @classmethod
     def _status_from_inspect(cls, account: dict[str, Any], inspected: dict[str, Any] | None) -> dict[str, Any]:
         desired = cls.image_for(account)
+        alias = str(account.get("runtime_alias") or account.get("id") or "")
+        uuid_val = str(account.get("instance_uuid") or "")
+        display = str(account.get("display_name") or alias)
+        res_key = str(account.get("resource_key") or "")
         base = {
-            "account_id": account["id"],
-            "display_name": str(account.get("display_name") or account["id"]),
+            "instance_uuid": uuid_val,
+            "runtime_alias": alias,
+            "account_id": alias,
+            "display_name": display,
+            "resource_key": res_key,
             "runtime_provider": PROVIDER,
             "enabled": bool(account.get("enabled", True)),
             "autostart": bool(account.get("autostart", True)),
@@ -1159,6 +1269,8 @@ class AgentWechatManager:
             "health_error": "",
             "wechat_login_status": "stopped",
             "logged_in_user": "",
+            "identity_observed_at": None,
+            "wechat_profile": None,
             "capabilities": {
                 "send_text": True,
                 "send_image": True,
@@ -1295,6 +1407,16 @@ class AgentWechatManager:
         status["runtime_health"] = "healthy"
         status["wechat_login_status"] = login_status
         status["logged_in_user"] = logged_in_user
+        if logged_in_user:
+            status["identity_observed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            status["wechat_profile"] = {
+                "wechat_user_id": logged_in_user,
+                "nickname": "",
+                "avatar_url": "",
+            }
+        else:
+            status["identity_observed_at"] = None
+            status["wechat_profile"] = None
         if login_error:
             status["login_status_error"] = login_error
         else:
@@ -1304,7 +1426,7 @@ class AgentWechatManager:
     @staticmethod
     def _persist_status(account: dict[str, Any], status: dict[str, Any]) -> dict[str, Any]:
         runtime_root = Path(os.environ.get("WECHAT_RUNTIME_DIR", "/run/wechat-runtime"))
-        target_dir = runtime_root / "accounts" / str(account["id"])
+        target_dir = runtime_root / "accounts" / str(account.get("runtime_alias") or account["id"])
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / "agent-status.json"
         temp = target.with_suffix(".json.tmp")
@@ -1328,15 +1450,36 @@ class AgentWechatManager:
     @staticmethod
     def _validate_managed_container(account: dict[str, Any], inspected: dict[str, Any]) -> str:
         labels = (inspected.get("Config") or {}).get("Labels") or {}
-        expected_account_id = str(account["id"])
-        if not isinstance(labels, dict) or (
-            str(labels.get(MANAGED_LABEL) or "") != "true"
-            or str(labels.get(ACCOUNT_LABEL) or "") != expected_account_id
-            or str(labels.get(PROVIDER_LABEL) or "") != PROVIDER
-        ):
+        if not isinstance(labels, dict) or str(labels.get(MANAGED_LABEL) or "") != "true":
+            raise AgentWechatRuntimeError("refusing managed container operation: container is not managed by WeChat Hub")
+
+        provider = str(labels.get(PROVIDER_LABEL) or "")
+        if provider not in {PROVIDER, SELKIES_PROVIDER}:
             raise AgentWechatRuntimeError(
-                f"refusing managed container operation: container labels do not match managed account {expected_account_id}"
+                f"refusing managed container operation: container provider {provider!r} does not match {PROVIDER}"
             )
+
+        target_uuid = str(account.get("instance_uuid") or "")
+        container_uuid = str(labels.get(INSTANCE_UUID_LABEL) or "")
+        if target_uuid and container_uuid:
+            if target_uuid != container_uuid:
+                raise AgentWechatRuntimeError(
+                    f"refusing managed container operation: container instance_uuid {container_uuid} does not match account {target_uuid}"
+                )
+        else:
+            expected_ids = {
+                str(account.get("id") or ""),
+                str(account.get("runtime_alias") or ""),
+                str(account.get("resource_key") or ""),
+            } - {""}
+            container_account = str(labels.get(ACCOUNT_LABEL) or "")
+            container_alias = str(labels.get(RUNTIME_ALIAS_LABEL) or "")
+            container_res_key = str(labels.get(RESOURCE_KEY_LABEL) or "")
+            if not ({container_account, container_alias, container_res_key} & expected_ids):
+                raise AgentWechatRuntimeError(
+                    f"refusing managed container operation: container labels do not match managed account {account.get('id')}"
+                )
+
         identifier = str(inspected.get("Id") or "")
         if not identifier:
             raise AgentWechatRuntimeError("refusing managed container operation: managed container has no id")
@@ -1440,8 +1583,14 @@ class AgentWechatManager:
         return self._persist_status(account, result)
 
     def stop(self, account: dict[str, Any]) -> dict[str, Any]:
-        _clear_login_flow(str(account["id"]))
-        _clear_desktop_sessions(str(account["id"]))
+        alias = str(account.get("runtime_alias") or account.get("id") or "")
+        uuid_val = str(account.get("instance_uuid") or "")
+        if uuid_val:
+            _clear_login_flow(uuid_val)
+            _clear_desktop_sessions(uuid_val)
+        if alias:
+            _clear_login_flow(alias)
+            _clear_desktop_sessions(alias)
         self._remove_selkies_container(account)
         inspected = self._find_container(account)
         if inspected is None:
@@ -1464,8 +1613,14 @@ class AgentWechatManager:
         return result
 
     def remove(self, account: dict[str, Any], *, purge_data: bool = False) -> dict[str, Any]:
-        _clear_login_flow(str(account["id"]))
-        _clear_desktop_sessions(str(account["id"]))
+        alias = str(account.get("runtime_alias") or account.get("id") or "")
+        uuid_val = str(account.get("instance_uuid") or "")
+        if uuid_val:
+            _clear_login_flow(uuid_val)
+            _clear_desktop_sessions(uuid_val)
+        if alias:
+            _clear_login_flow(alias)
+            _clear_desktop_sessions(alias)
         self._remove_selkies_container(account)
         inspected = self._find_container(account) if self.engine.available else None
         if inspected is not None:
@@ -1485,7 +1640,9 @@ class AgentWechatManager:
             if root.is_dir() and str(root).startswith("/config/agent-wechat/"):
                 shutil.rmtree(root)
         return {
-            "removed": account["id"],
+            "instance_uuid": uuid_val,
+            "runtime_alias": alias,
+            "removed": account.get("id") or alias,
             "runtime_provider": PROVIDER,
             "preserve_data": not purge_data,
             "data_volume": data_volume,
@@ -1711,9 +1868,23 @@ class AgentWechatManager:
         ):
             auth_status = "logged_in"
             logged_in_user = str(flow.get("logged_in_user") or logged_in_user)
+        observed_at = status.get("identity_observed_at")
+        profile = status.get("wechat_profile")
+        if logged_in_user and not profile:
+            observed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            profile = {
+                "wechat_user_id": logged_in_user,
+                "nickname": "",
+                "avatar_url": "",
+            }
         return {
+            "instance_uuid": str(account.get("instance_uuid") or ""),
+            "runtime_alias": str(account.get("runtime_alias") or account.get("id") or ""),
             "account_id": account["id"],
-            "display_name": str(account.get("display_name") or account["id"]),
+            "display_name": str(account.get("display_name") or account.get("runtime_alias") or account["id"]),
+            "resource_key": str(account.get("resource_key") or ""),
+            "container_id": str(status.get("container_id") or ""),
+            "container_name": str(status.get("container_name") or ""),
             "runtime_provider": PROVIDER,
             "running": bool(status.get("container_running")),
             "container_running": bool(status.get("container_running")),
@@ -1731,6 +1902,8 @@ class AgentWechatManager:
             "window_title": "agent-wechat",
             "auth_status": auth_status,
             "logged_in_user": logged_in_user,
+            "identity_observed_at": observed_at,
+            "wechat_profile": profile,
             "login_flow_state": flow_state or "idle",
             "login_flow_status": str(flow.get("status_message") or ""),
             "login_flow_error": str(flow.get("error") or ""),
@@ -1880,7 +2053,10 @@ class AgentWechatManager:
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
         descriptor = {
+            "instance_uuid": str(account.get("instance_uuid") or ""),
+            "runtime_alias": str(account.get("runtime_alias") or account.get("id") or ""),
             "account_id": str(account["id"]),
+            "resource_key": str(account.get("resource_key") or ""),
             "runtime_provider": PROVIDER,
             "desktop_provider": selected_provider,
             "novnc_reconciled": novnc_reconciled,
