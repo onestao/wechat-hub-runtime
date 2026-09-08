@@ -1429,11 +1429,24 @@ class AgentWechatManager:
         target_dir = runtime_root / "accounts" / str(account.get("runtime_alias") or account["id"])
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / "agent-status.json"
-        temp = target.with_suffix(".json.tmp")
+        temp = target_dir / f".{target.name}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(8)}.tmp"
         payload = dict(status)
         payload["updated_at"] = int(time.time())
-        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(temp, target)
+        try:
+            temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            for attempt in range(5):
+                try:
+                    os.replace(temp, target)
+                    break
+                except PermissionError:
+                    if attempt == 4 or os.name != "nt":
+                        raise
+                    time.sleep(0.005)
+        finally:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
         return status
 
     def status(self, account: dict[str, Any], *, probe_timeout: float | None = None) -> dict[str, Any]:
