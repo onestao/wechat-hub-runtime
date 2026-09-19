@@ -1481,7 +1481,13 @@ class AgentWechatManager:
             "",
         )
 
-    def _hydrate_self_profile(self, account: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+    def _hydrate_self_profile(
+        self,
+        account: dict[str, Any],
+        profile: dict[str, Any],
+        *,
+        allow_probe: bool = True,
+    ) -> dict[str, Any]:
         """Enrich a runtime profile with the AgentWechat self record.
 
         The logged-in user id (``wxid``) is looked up on the AgentWechat side so
@@ -1491,6 +1497,10 @@ class AgentWechatManager:
         available the profile is returned unchanged so downstream layers fall
         back to labelling the wxid as an internal account id rather than
         presenting it as a nickname.
+
+        ``allow_probe=False`` is used by the short-budget list path: it reuses a
+        warm cache but never pays for a fresh probe, so listing accounts can
+        never overwrite the hydrated profile with a bare one.
         """
 
         wxid = str(profile.get("wechat_user_id") or "").strip()
@@ -1505,6 +1515,8 @@ class AgentWechatManager:
             merged.update({key: value for key, value in profile.items() if value})
             merged.setdefault("identity_source", str(cached.get("identity_source") or "unavailable"))
             return merged
+        if not allow_probe:
+            return profile
 
         identity_source = "unavailable"
         nickname = ""
@@ -1604,8 +1616,11 @@ class AgentWechatManager:
                 # Full status path (the one that persists agent-status.json and
                 # therefore feeds Core): carry the AgentWechat self record so the
                 # identity projection can hydrate.  The short list-probe path
-                # stays cheap.
+                # reuses a warm cache but never pays for a fresh probe, so it
+                # cannot overwrite a hydrated profile with a bare one.
                 profile = self._hydrate_self_profile(account, profile)
+            else:
+                profile = self._hydrate_self_profile(account, profile, allow_probe=False)
             status["wechat_profile"] = profile
         else:
             status["identity_observed_at"] = None
