@@ -1595,11 +1595,18 @@ class AgentWechatManager:
         status["logged_in_user"] = logged_in_user
         if logged_in_user:
             status["identity_observed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            status["wechat_profile"] = {
+            profile = {
                 "wechat_user_id": logged_in_user,
                 "nickname": "",
                 "avatar_url": "",
             }
+            if probe_timeout is None:
+                # Full status path (the one that persists agent-status.json and
+                # therefore feeds Core): carry the AgentWechat self record so the
+                # identity projection can hydrate.  The short list-probe path
+                # stays cheap.
+                profile = self._hydrate_self_profile(account, profile)
+            status["wechat_profile"] = profile
         else:
             status["identity_observed_at"] = None
             status["wechat_profile"] = None
