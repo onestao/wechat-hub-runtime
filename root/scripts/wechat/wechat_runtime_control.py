@@ -148,6 +148,9 @@ def _bool(payload: dict[str, Any], key: str, default: bool) -> bool:
 
 
 def _error_code(exc: Exception) -> str:
+    explicit = str(getattr(exc, "code", "") or "")
+    if explicit:
+        return explicit
     if isinstance(exc, ValueError):
         return "invalid_request"
     message = str(exc).lower()
@@ -234,6 +237,28 @@ def dispatch_action(registry: Registry, request: dict[str, Any]) -> dict[str, An
         if action == "health":
             data = registry.load(create=False)
             return {"ok": True, "accounts": len(data["accounts"])}
+
+        # Consumer Control (Disabled / EFB / Agent).  These actions are not
+        # account-scoped and are the only way Console can start or stop a
+        # message consumer without touching the Docker socket itself.
+        if action in {"consumers", "consumers_mode", "consumer_action"}:
+            from consumer_control import ConsumerControl, ConsumerControlError
+
+            control = ConsumerControl()
+            if action == "consumers":
+                return {"consumers": control.snapshot()}
+            if action == "consumers_mode":
+                mode = str(request.get("mode") or "").strip().lower()
+                return {"consumers": control.set_mode(mode)}
+            consumer = str(request.get("consumer") or "").strip().lower()
+            operation = str(request.get("operation") or "").strip().lower()
+            if operation == "start":
+                control.start(consumer)
+            elif operation == "stop":
+                control.stop(consumer)
+            else:
+                raise ValueError(f"unsupported consumer operation: {operation}")
+            return {"consumers": control.snapshot()}
 
         account_id = str(request.get("account_id") or request.get("instance_uuid") or "").strip()
         if not account_id:
