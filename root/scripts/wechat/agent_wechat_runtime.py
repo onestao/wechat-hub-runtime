@@ -44,6 +44,77 @@ INSTANCE_UUID_LABEL = "com.wechat-hub.instance-uuid"
 RUNTIME_ALIAS_LABEL = "com.wechat-hub.runtime-alias"
 RESOURCE_KEY_LABEL = "com.wechat-hub.resource-key"
 
+# Bounded desktop reconciliation budget.  The child's own desktop stack keeps
+# booting after ``start_container`` returns, so a single exec can legitimately
+# miss x11vnc; retry a small, fixed number of times before judging by the
+# observed post-condition.
+DESKTOP_RECONCILE_ATTEMPTS = 3
+DESKTOP_RECONCILE_BACKOFF_SEC = 3.0
+
+# How many consecutive authoritative observations are required before the login
+# FSM converges without a Login WebSocket witness.
+AUTHORITATIVE_LOGIN_CONFIRMATIONS = 2
+
+# A login socket that has not emitted an event for this long is no longer a
+# usable witness (lost QR callback / hung socket), so the authoritative
+# observation takes over.
+LOGIN_FLOW_STALL_SEC = 45.0
+
+# Upper bound on how long the socket may remain the witness once WeChat itself
+# reports a logged-in account.  This bounds convergence even if the socket
+# keeps emitting non-terminal events.
+LOGIN_FLOW_SETTLE_SEC = 30.0
+
+# Product-level login FSM vocabulary shared with Core and Console.
+LOGIN_STATE_CREATING = "CREATING"
+LOGIN_STATE_QR_READY = "QR_READY"
+LOGIN_STATE_QR_SCANNED = "QR_SCANNED"
+LOGIN_STATE_PHONE_CONFIRM_PENDING = "PHONE_CONFIRM_PENDING"
+LOGIN_STATE_WECHAT_LOGGED_IN = "WECHAT_LOGGED_IN"
+LOGIN_STATE_IDENTITY_HYDRATING = "IDENTITY_HYDRATING"
+LOGIN_STATE_READY = "READY"
+LOGIN_STATE_FAILED = "FAILED"
+
+
+def normalize_login_state(
+    *,
+    flow_state: str,
+    auth_status: str,
+    logged_in_user: str,
+    container_running: bool,
+) -> str:
+    """Project the runtime's internal flow state onto the product login FSM.
+
+    The authoritative observation wins over the socket: a real logged-in
+    account is never reported as FAILED just because a login socket timed out.
+    """
+
+    flow_state = str(flow_state or "")
+    auth_status = str(auth_status or "")
+    if auth_status == "logged_in" and logged_in_user:
+        return LOGIN_STATE_WECHAT_LOGGED_IN
+    if not container_running:
+        return LOGIN_STATE_CREATING
+    if flow_state in {"timeout", "error"}:
+        return LOGIN_STATE_FAILED
+    if flow_state == "phone_confirm":
+        return LOGIN_STATE_PHONE_CONFIRM_PENDING
+    if flow_state == "waiting_for_scan":
+        return LOGIN_STATE_QR_READY
+    if flow_state in {"authenticating", "starting", ""}:
+        return LOGIN_STATE_CREATING
+    if flow_state == "logged_in":
+        return LOGIN_STATE_WECHAT_LOGGED_IN
+    return LOGIN_STATE_CREATING
+
+# Self identity hydration is cached so a status poll never turns into an
+# unbounded per-request contact-database scan.
+SELF_PROFILE_TTL_SEC = 300.0
+SELF_PROFILE_TIMEOUT_SEC = 6.0
+
+_SELF_PROFILE_CACHE: dict[str, dict[str, Any]] = {}
+_SELF_PROFILE_CACHE_LOCK = threading.Lock()
+
 logger = logging.getLogger("agent_wechat_runtime")
 PROVIDER_LABEL = "com.wechat-hub.provider"
 PROVIDER = "agent_wechat"
@@ -230,12 +301,28 @@ SELKIES_ATTACH_ENV = _selkies_attach_env()
 # interpolated into this shell program.  It only reconciles the upstream
 # default X11 desktop (:99/5900) from view-only to interactive while retaining
 # localhost-only VNC exposure.
+#
+# SELF-MATCH HAZARD (R14-FF-DESKTOP-SELF-KILL): this program text is passed to
+# ``/bin/sh -c``, so the shell's own command line *contains* the literals
+# ``x11vnc``, ``-display :99``, ``-rfbport 5900`` and ``-viewonly``.  A naive
+# ``ps -eo pid=,args=`` scan therefore matches the shell itself; the script
+# then reads its own PID, decides the "x11vnc" it found is view-only, and
+# SIGTERMs itself -> exit 143 with empty output.  The matcher below therefore
+# keys on ``comm`` (the real executable name) and explicitly excludes our own
+# PID and our parent, so only a genuine x11vnc process can ever match.
 INTERACTIVE_DESKTOP_COMMAND = [
     "/bin/sh",
     "-c",
     """set -eu
+self=$$
+parent="${PPID:-0}"
 find_x11vnc() {
-  ps -eo pid=,args= | awk '$0 ~ /[x]11vnc/ && $0 ~ /-display :99/ && $0 ~ /-rfbport 5900/ {print; exit}'
+  ps -eo pid=,ppid=,comm=,args= | awk -v self="$self" -v parent="$parent" '
+    $1 == self { next }
+    $1 == parent { next }
+    $3 !~ /^x11vnc/ { next }
+    $0 ~ /-display :99/ && $0 ~ /-rfbport 5900/ { print; exit }
+  '
 }
 i=0
 line=""
@@ -252,12 +339,21 @@ case " $line " in
 esac
 pid="$(printf '%s\n' "$line" | awk '{print $1}')"
 case "$pid" in ''|*[!0-9]*) echo 'state=invalid-pid'; exit 4 ;; esac
-kill "$pid"
+[ "$pid" = "$self" ] && { echo 'state=self-match'; exit 7; }
+kill "$pid" 2>/dev/null || true
 i=0
 while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do
   i=$((i + 1))
   sleep 0.1
 done
+if kill -0 "$pid" 2>/dev/null; then
+  kill -9 "$pid" 2>/dev/null || true
+  i=0
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do
+    i=$((i + 1))
+    sleep 0.1
+  done
+fi
 if kill -0 "$pid" 2>/dev/null; then
   echo 'state=stop-timeout'
   exit 5
@@ -492,10 +588,27 @@ class DockerEngine:
         try:
             value = self.request("POST", f"/containers/create?{query}", payload, expected=(201,))
         except AgentWechatRuntimeError as exc:
-            if "No such image" not in str(exc):
+            message = str(exc)
+            if "No such image" in message:
+                self.pull_image(str(payload["Image"]))
+                value = self.request("POST", f"/containers/create?{query}", payload, expected=(201,))
+            elif "already in use" in message or " returned 409:" in message:
+                # Idempotent create.  A repeated or concurrent "Add WeChat" for
+                # the same alias must adopt the child that already exists
+                # instead of surfacing a conflict and never create a second
+                # child for one account.  Only a container that is already
+                # managed by this product may be adopted.
+                existing = self.inspect_container(name)
+                if existing is None:
+                    raise
+                labels = (existing.get("Config") or {}).get("Labels") or {}
+                if str(labels.get(MANAGED_LABEL) or "") != "true":
+                    raise AgentWechatRuntimeError(
+                        f"refusing to adopt container {name!r}: it is not managed by WeChat Hub"
+                    ) from exc
+                return existing
+            else:
                 raise
-            self.pull_image(str(payload["Image"]))
-            value = self.request("POST", f"/containers/create?{query}", payload, expected=(201,))
         return value if isinstance(value, dict) else {}
 
     def start_container(self, identifier: str) -> None:
@@ -1306,7 +1419,8 @@ class AgentWechatManager:
         *,
         timeout: float = 20.0,
         authenticated: bool = True,
-    ) -> dict[str, Any]:
+        allow_list: bool = False,
+    ) -> Any:
         body = None
         headers: dict[str, str] = {}
         if authenticated:
@@ -1328,11 +1442,13 @@ class AgentWechatManager:
         if len(raw) > 4 * 1024 * 1024:
             raise AgentWechatRuntimeError("agent-wechat API response is too large")
         if not raw:
-            return {}
+            return [] if allow_list else {}
         try:
             value = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise AgentWechatRuntimeError("agent-wechat API returned invalid JSON") from exc
+        if allow_list:
+            return value
         if not isinstance(value, dict):
             raise AgentWechatRuntimeError("agent-wechat API response must be an object")
         return value
@@ -1364,6 +1480,76 @@ class AgentWechatManager:
             str(auth.get("loggedInUser") or auth.get("logged_in_user") or ""),
             "",
         )
+
+    def _hydrate_self_profile(self, account: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+        """Enrich a runtime profile with the AgentWechat self record.
+
+        The logged-in user id (``wxid``) is looked up on the AgentWechat side so
+        the Runtime account registry carries the real ``nickname`` / ``alias`` /
+        ``avatar`` instead of only the internal account id.  The probe is
+        bounded and cached, and never raises: when the self record is not
+        available the profile is returned unchanged so downstream layers fall
+        back to labelling the wxid as an internal account id rather than
+        presenting it as a nickname.
+        """
+
+        wxid = str(profile.get("wechat_user_id") or "").strip()
+        if not wxid:
+            return profile
+        account_id = str(account["id"])
+        now = time.time()
+        with _SELF_PROFILE_CACHE_LOCK:
+            cached = _SELF_PROFILE_CACHE.get(account_id)
+        if cached and now - float(cached.get("fetched_at") or 0.0) < SELF_PROFILE_TTL_SEC:
+            merged = dict(cached.get("profile") or {})
+            merged.update({key: value for key, value in profile.items() if value})
+            merged.setdefault("identity_source", str(cached.get("identity_source") or "unavailable"))
+            return merged
+
+        identity_source = "unavailable"
+        nickname = ""
+        alias = ""
+        avatar_url = ""
+        try:
+            rows = self._request_json_direct(
+                account,
+                "GET",
+                "/api/contacts/find?name=" + urllib.parse.quote(wxid, safe=""),
+                timeout=SELF_PROFILE_TIMEOUT_SEC,
+                authenticated=True,
+                allow_list=True,
+            )
+            if isinstance(rows, list):
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    username = str(row.get("username") or row.get("userName") or "")
+                    if username != wxid:
+                        continue
+                    nickname = str(row.get("remark") or row.get("nick_name") or "").strip()
+                    alias = str(row.get("alias") or "").strip()
+                    avatar_url = str(row.get("small_head_url") or "").strip()
+                    identity_source = "agent_wechat_self_profile"
+                    break
+        except Exception as exc:  # pragma: no cover - defensive, must never fail status
+            logger.debug("self profile hydration for %s failed: %s", account_id, exc)
+
+        hydrated = dict(profile)
+        if nickname and nickname != wxid:
+            hydrated["nickname"] = nickname
+        if alias:
+            hydrated["wechat_id"] = alias
+        if avatar_url:
+            hydrated["avatar_url"] = avatar_url
+        hydrated["identity_source"] = identity_source
+        hydrated["identity_updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with _SELF_PROFILE_CACHE_LOCK:
+            _SELF_PROFILE_CACHE[account_id] = {
+                "fetched_at": now,
+                "profile": dict(hydrated),
+                "identity_source": identity_source,
+            }
+        return hydrated
 
     def _enrich_health(
         self,
@@ -1523,6 +1709,62 @@ class AgentWechatManager:
         if error:
             raise AgentWechatRuntimeError(error)
 
+    def _expected_network(self) -> str:
+        try:
+            _root, network = self._host_config_root_and_network()
+        except Exception:  # pragma: no cover - defensive; config read only
+            return ""
+        return str(network or "")
+
+    def desktop_post_condition(self, account: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        """Observe the real post-condition of a desktop/start operation.
+
+        A Docker exec exit code is an *operation* result, not a product result.
+        The product answer is ``operation result AND observed post-condition``,
+        so this observation is the authority whenever the operation reports a
+        failure.  Every element below is read from Docker/runtime truth:
+
+        * child container exists
+        * child container running
+        * child runs the exact expected image (digest-pinned compare)
+        * child is attached to the expected network
+        * account ownership (managed/provider/instance_uuid labels) is correct
+        * the desktop service inside the child is reachable
+        """
+
+        evidence: dict[str, Any] = {
+            "container_exists": False,
+            "container_running": False,
+            "exact_image": False,
+            "expected_network": False,
+            "ownership_ok": False,
+            "desktop_service_reachable": False,
+        }
+        if not self.engine.available:
+            return False, evidence
+        inspected = self._find_container(account)
+        if not inspected:
+            return False, evidence
+        evidence["container_exists"] = True
+        evidence["container_running"] = bool((inspected.get("State") or {}).get("Running"))
+        current_image = str((inspected.get("Config") or {}).get("Image") or "")
+        evidence["exact_image"] = bool(current_image) and current_image == self.image_for(account)
+        networks = ((inspected.get("NetworkSettings") or {}).get("Networks") or {})
+        expected_network = self._expected_network()
+        evidence["expected_network"] = bool(expected_network) and expected_network in networks
+        try:
+            self._validate_managed_container(account, inspected)
+            evidence["ownership_ok"] = True
+        except AgentWechatRuntimeError:
+            evidence["ownership_ok"] = False
+        if evidence["container_running"]:
+            try:
+                healthy, _error = self._probe_agent_server(account, timeout=3.0)
+            except Exception:  # pragma: no cover - probe is already defensive
+                healthy = False
+            evidence["desktop_service_reachable"] = bool(healthy)
+        return all(bool(value) for value in evidence.values()), evidence
+
     def ensure_interactive_desktop(self, account: dict[str, Any]) -> dict[str, Any]:
         """Reconcile upstream's default x11vnc into safe interactive mode.
 
@@ -1531,6 +1773,14 @@ class AgentWechatManager:
         targets DISPLAY=:99 / rfbport=5900.  No VNC port is published to the
         host; browser traffic still traverses upstream websockify/agent-server
         and the WeChat Hub Desktop Gateway.
+
+        The exec is retried a bounded number of times because the child's own
+        desktop stack may still be booting when the container start returns.
+        If every attempt still reports a failure, the observed post-condition
+        decides: a child that exists, runs, is on the expected image/network,
+        is owned by this account and answers its desktop service has already
+        reached the product goal, so the caller must not be told the operation
+        failed.
         """
 
         if not self.engine.available:
@@ -1542,30 +1792,89 @@ class AgentWechatManager:
         if not bool((inspected.get("State") or {}).get("Running")):
             raise AgentWechatRuntimeError("agent-wechat desktop container is stopped")
         self._assert_no_running_resource_drift(account, inspected)
-        exit_code, output = self.engine.exec_container(
-            identifier,
-            list(INTERACTIVE_DESKTOP_COMMAND),
-            timeout=25.0,
-            attach_stderr=True,
-        )
-        text = output.decode("utf-8", errors="replace").strip()
-        if exit_code != 0:
-            raise AgentWechatRuntimeError(
-                f"interactive desktop reconciliation failed ({exit_code}): {text or 'unknown error'}"
+
+        last_error = ""
+        for attempt in range(1, DESKTOP_RECONCILE_ATTEMPTS + 1):
+            try:
+                exit_code, output = self.engine.exec_container(
+                    identifier,
+                    list(INTERACTIVE_DESKTOP_COMMAND),
+                    timeout=25.0,
+                    attach_stderr=True,
+                )
+            except AgentWechatRuntimeError as exc:
+                exit_code, output = None, b""
+                last_error = str(exc)
+            text = output.decode("utf-8", errors="replace").strip()
+            if exit_code == 0:
+                state = (
+                    "interactive"
+                    if "state=interactive" in text
+                    else "restarted"
+                    if "state=restarted" in text
+                    else "unknown"
+                )
+                if state != "unknown":
+                    return {
+                        "account_id": str(account["id"]),
+                        "display": ":99",
+                        "rfbport": 5900,
+                        "listen": "127.0.0.1",
+                        "interactive": True,
+                        "action": state,
+                        "attempts": attempt,
+                    }
+                last_error = "interactive desktop reconciliation returned an unknown state"
+            elif exit_code is not None:
+                last_error = (
+                    f"interactive desktop reconciliation failed ({exit_code}): {text or 'unknown error'}"
+                )
+            if attempt < DESKTOP_RECONCILE_ATTEMPTS:
+                time.sleep(DESKTOP_RECONCILE_BACKOFF_SEC)
+
+        satisfied, evidence = self.desktop_post_condition(account)
+        if satisfied:
+            logger.warning(
+                "agent-wechat desktop reconciliation for account %s reported %r, but the observed "
+                "post-condition holds (%s); reporting the true final state instead of a failure",
+                account.get("id"),
+                last_error,
+                evidence,
             )
-        state = "interactive" if "state=interactive" in text else "restarted" if "state=restarted" in text else "unknown"
-        if state == "unknown":
-            raise AgentWechatRuntimeError("interactive desktop reconciliation returned an unknown state")
-        return {
-            "account_id": str(account["id"]),
-            "display": ":99",
-            "rfbport": 5900,
-            "listen": "127.0.0.1",
-            "interactive": True,
-            "action": state,
-        }
+            return {
+                "account_id": str(account["id"]),
+                "display": ":99",
+                "rfbport": 5900,
+                "listen": "127.0.0.1",
+                "interactive": None,
+                "desktop_mode": "unconfirmed",
+                "action": "reconciled",
+                "attempts": DESKTOP_RECONCILE_ATTEMPTS,
+                "reconciliation": {"operation_error": last_error, "post_condition": evidence},
+            }
+        raise AgentWechatRuntimeError(last_error or "interactive desktop reconciliation failed")
 
     def start(self, account: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self._start_inner(account)
+        except AgentWechatRuntimeError as exc:
+            satisfied, evidence = self.desktop_post_condition(account)
+            if not satisfied:
+                raise
+            logger.warning(
+                "agent-wechat start for account %s reported %r, but the observed post-condition "
+                "holds (%s); reporting the true final state instead of a failure",
+                account.get("id"),
+                str(exc),
+                evidence,
+            )
+            refreshed = self.engine.inspect_container(self.container_name(account))
+            result = self._enrich_health(account, self._status_from_inspect(account, refreshed))
+            result["action"] = "reconciled"
+            result["reconciliation"] = {"operation_error": str(exc), "post_condition": evidence}
+            return self._persist_status(account, result)
+
+    def _start_inner(self, account: dict[str, Any]) -> dict[str, Any]:
         inspected = self.ensure_container(account)
         identifier = str(inspected.get("Id") or self.container_name(account))
         if not bool(inspected.get("State", {}).get("Running")):
@@ -1778,12 +2087,16 @@ class AgentWechatManager:
                         if data_url:
                             # QR bytes are intentionally process-memory only.
                             flow["qr_data_url"] = data_url
-                            flow["state"] = "waiting_for_scan"
+                            if str(flow.get("state") or "") != "logged_in":
+                                flow["state"] = "waiting_for_scan"
                         status_event = event.get("status")
                         if isinstance(status_event, dict):
                             flow["status_message"] = str(status_event.get("message") or "")
                         if "phone_confirm" in event or event_type == "phone_confirm":
-                            flow["state"] = "phone_confirm"
+                            # Never downgrade a state that authoritative
+                            # observation already converged to logged_in.
+                            if str(flow.get("state") or "") != "logged_in":
+                                flow["state"] = "phone_confirm"
                             flow["qr_data_url"] = ""
                         success = event.get("login_success")
                         if isinstance(success, dict) or event_type == "login_success":
@@ -1791,11 +2104,13 @@ class AgentWechatManager:
                             flow["state"] = "logged_in"
                             flow["logged_in_user"] = str(
                                 details.get("userId") or details.get("user_id") or ""
-                            )
+                            ) or str(flow.get("logged_in_user") or "")
                             flow["qr_data_url"] = ""
+                            flow["error"] = ""
                             break
                         if "login_timeout" in event or event_type == "login_timeout":
-                            flow["state"] = "timeout"
+                            if str(flow.get("state") or "") != "logged_in":
+                                flow["state"] = "timeout"
                             flow["qr_data_url"] = ""
                             break
                         error = event.get("error")
@@ -1805,8 +2120,9 @@ class AgentWechatManager:
                                 error_message = str(error.get("message") or "")
                             elif isinstance(error, str):
                                 error_message = error
-                            flow["state"] = "error"
-                            flow["error"] = error_message or str(message or "agent-wechat login flow failed")
+                            if str(flow.get("state") or "") != "logged_in":
+                                flow["state"] = "error"
+                                flow["error"] = error_message or str(message or "agent-wechat login flow failed")
                             flow["qr_data_url"] = ""
                             break
             finally:
@@ -1816,8 +2132,9 @@ class AgentWechatManager:
                     pass
         except Exception as exc:
             with lock:
-                flow["state"] = "error"
-                flow["error"] = str(exc)
+                if str(flow.get("state") or "") != "logged_in":
+                    flow["state"] = "error"
+                    flow["error"] = str(exc)
         finally:
             with lock:
                 flow["running"] = False
@@ -1844,6 +2161,9 @@ class AgentWechatManager:
                     "error": "",
                     "status_message": "",
                     "updated_at": time.time(),
+                    "authoritative_logged_in_streak": 0,
+                    "authoritative_logged_in_since": 0.0,
+                    "converged_from_observation": False,
                 }
                 _LOGIN_FLOWS[account_id] = flow
             assert flow is not None
@@ -1861,26 +2181,118 @@ class AgentWechatManager:
                     thread.start()
         return flow
 
+    def _note_authoritative_login(
+        self,
+        account_id: str,
+        logged_in_user: str,
+        *,
+        witness_alive: bool,
+    ) -> int:
+        """Advance the login FSM from authoritative observation.
+
+        The Login WebSocket is one *witness*, not the authority.  A lost QR
+        callback, a closed socket, one polling timeout or a desktop reconcile
+        error must never outrank the fact that WeChat itself reports a
+        logged-in account with a resolvable user id.
+
+        Two guards keep the original safety property intact:
+
+        * convergence needs ``AUTHORITATIVE_LOGIN_CONFIRMATIONS`` consecutive
+          observations, so a single transient probe cannot finish a login;
+        * while the login socket is still alive and emitting events, or has
+          been observed logged-in for less than ``LOGIN_FLOW_SETTLE_SEC``, the
+          socket remains the witness.  That is what stops the "visible chat
+          appeared but the login plan is still extracting database
+          credentials" window from being reported as a finished login.
+        """
+
+        now = time.time()
+        with _LOGIN_FLOWS_LOCK:
+            flow = _LOGIN_FLOWS.get(account_id)
+            if not flow:
+                return 0
+            lock = flow["lock"]
+        with lock:
+            if str(flow.get("state") or "") == "logged_in":
+                return int(flow.get("authoritative_logged_in_streak") or 0)
+            streak = int(flow.get("authoritative_logged_in_streak") or 0) + 1
+            flow["authoritative_logged_in_streak"] = streak
+            since = float(flow.get("authoritative_logged_in_since") or 0.0)
+            if not since:
+                since = now
+                flow["authoritative_logged_in_since"] = since
+            settled = (now - since) >= LOGIN_FLOW_SETTLE_SEC
+            if streak >= AUTHORITATIVE_LOGIN_CONFIRMATIONS and (settled or not witness_alive):
+                flow["state"] = "logged_in"
+                flow["logged_in_user"] = str(logged_in_user or flow.get("logged_in_user") or "")
+                flow["qr_data_url"] = ""
+                flow["error"] = ""
+                flow["status_message"] = ""
+                flow["converged_from_observation"] = True
+                flow["updated_at"] = now
+            return streak
+
+    def _reset_authoritative_login(self, account_id: str) -> None:
+        with _LOGIN_FLOWS_LOCK:
+            flow = _LOGIN_FLOWS.get(account_id)
+            if not flow:
+                return
+            lock = flow["lock"]
+        with lock:
+            if str(flow.get("state") or "") == "logged_in" and not bool(flow.get("running")):
+                return
+            flow["authoritative_logged_in_streak"] = 0
+            flow["authoritative_logged_in_since"] = 0.0
+
     def login_status(self, account: dict[str, Any]) -> dict[str, Any]:
         status = self.status(account)
         auth_status = str(status.get("wechat_login_status") or "unknown")
         logged_in_user = str(status.get("logged_in_user") or "")
-        flow = self._login_flow_snapshot(str(account["id"]))
+        account_id = str(account["id"])
+        healthy = status.get("agent_server_healthy") is True
+        container_running = bool(status.get("container_running"))
+
+        flow = self._login_flow_snapshot(account_id)
         flow_state = str(flow.get("state") or "")
-        if flow and flow_state != "logged_in" and bool(flow.get("running")) and auth_status == "logged_in":
-            # The visible chat UI can appear before the full upstream login
-            # plan finishes detecting the account and persisting DB credentials.
-            # Do not report success to Console until Login WebSocket emits
-            # login_success, otherwise Sync can race the credential extraction.
+        flow_running = bool(flow.get("running"))
+        flow_age = time.time() - float(flow.get("updated_at") or 0.0) if flow else 0.0
+        # A socket that stopped emitting events is no longer a usable witness.
+        witness_alive = bool(
+            flow
+            and flow_running
+            and flow_state not in {"timeout", "error"}
+            and flow_age < LOGIN_FLOW_STALL_SEC
+        )
+        observation_logged_in = bool(
+            container_running and healthy and auth_status == "logged_in" and logged_in_user
+        )
+
+        if observation_logged_in:
+            self._note_authoritative_login(account_id, logged_in_user, witness_alive=witness_alive)
+        else:
+            self._reset_authoritative_login(account_id)
+
+        flow = self._login_flow_snapshot(account_id)
+        flow_state = str(flow.get("state") or "")
+        if flow_state == "logged_in":
+            # Socket-confirmed, or converged from observation.  A weaker probe
+            # may not contradict it, but an explicit live "logged_out" must
+            # still win over stale in-memory success.
+            if auth_status in {"unknown", "app_not_running"}:
+                auth_status = "logged_in"
+                logged_in_user = str(flow.get("logged_in_user") or "") or logged_in_user
+            elif auth_status == "logged_in":
+                logged_in_user = logged_in_user or str(flow.get("logged_in_user") or "")
+        elif observation_logged_in and flow:
+            # A login session is in progress and has not converged yet: either
+            # the socket is still our witness and may still be persisting
+            # credentials, or the confirmation window has not elapsed.  Keep
+            # the flow state and do not report success yet — convergence is
+            # bounded and lands within a couple of polls (or the settle
+            # window).  With no login session at all the observation is the
+            # only witness and is reported as-is.
             auth_status = "unknown"
             logged_in_user = ""
-        if (
-            flow_state == "logged_in"
-            and status.get("agent_server_healthy") is True
-            and auth_status in {"unknown", "app_not_running"}
-        ):
-            auth_status = "logged_in"
-            logged_in_user = str(flow.get("logged_in_user") or logged_in_user)
         observed_at = status.get("identity_observed_at")
         profile = status.get("wechat_profile")
         if logged_in_user and not profile:
@@ -1890,6 +2302,10 @@ class AgentWechatManager:
                 "nickname": "",
                 "avatar_url": "",
             }
+        if logged_in_user and profile:
+            # Self-identity hydration: enrich the runtime profile from the
+            # AgentWechat self record (bounded, cached, never blocking).
+            profile = self._hydrate_self_profile(account, dict(profile))
         return {
             "instance_uuid": str(account.get("instance_uuid") or ""),
             "runtime_alias": str(account.get("runtime_alias") or account.get("id") or ""),
@@ -1920,6 +2336,15 @@ class AgentWechatManager:
             "login_flow_state": flow_state or "idle",
             "login_flow_status": str(flow.get("status_message") or ""),
             "login_flow_error": str(flow.get("error") or ""),
+            "login_flow_source": (
+                "observation" if flow.get("converged_from_observation") else "websocket"
+            ),
+            "login_state": normalize_login_state(
+                flow_state=flow_state,
+                auth_status=auth_status,
+                logged_in_user=logged_in_user,
+                container_running=container_running,
+            ),
         }
 
     def start_login(self, account: dict[str, Any]) -> dict[str, Any]:

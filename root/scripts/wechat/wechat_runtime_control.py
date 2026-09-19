@@ -240,6 +240,41 @@ def dispatch_action(registry: Registry, request: dict[str, Any]) -> dict[str, An
             raise ValueError("account_id is required")
 
         if action == "register":
+            existing = None
+            with registry.locked():
+                data = registry.load(create=False)
+                for item in data["accounts"]:
+                    if account_id in {
+                        str(item.get("runtime_alias") or ""),
+                        str(item.get("id") or ""),
+                        str(item.get("instance_uuid") or ""),
+                    }:
+                        existing = item
+                        break
+            if existing is not None:
+                requested_provider = str(
+                    request.get("runtime_provider") or request.get("provider") or "legacy"
+                ).strip().lower()
+                if runtime_provider(existing) != requested_provider:
+                    raise RuntimeErrorWithHint(
+                        "account already exists with runtime_provider="
+                        f"{runtime_provider(existing)}: {account_id}"
+                    )
+                # Idempotent register: a repeated or concurrent "Add WeChat" for
+                # the same alias returns the existing child and its live status.
+                # It must never create a second child and must never disturb an
+                # already-logged-in container.
+                if _bool(request, "start", True):
+                    return {
+                        "account": existing,
+                        "status": start_account(existing, registry.paths),
+                        "idempotent": True,
+                    }
+                return {
+                    "account": existing,
+                    "status": status_for(existing),
+                    "idempotent": True,
+                }
             account = register_account(
                 registry,
                 account_id,
