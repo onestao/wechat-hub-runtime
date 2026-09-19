@@ -2433,7 +2433,19 @@ class RuntimeRegistryTests(unittest.TestCase):
             self.assertEqual(status["resource_policy_drift"], {})
             self.assertFalse(status["resource_reconcile_required"])
             self.assertEqual(api_result, {"status": "logged_in"})
-            request_mock.assert_called_once()
+            # The status path may additionally probe the AgentWechat self
+            # profile (P0-3 identity hydration); what this test guards is that
+            # the explicit API request still reached the agent-server exactly
+            # once and that no other endpoint was contacted.
+            request_paths = [str(item.args[2]) for item in request_mock.call_args_list]
+            self.assertEqual(request_paths.count("/api/status/auth"), 1)
+            self.assertTrue(
+                all(
+                    path == "/api/status/auth" or path.startswith("/api/contacts/find")
+                    for path in request_paths
+                ),
+                request_paths,
+            )
             self.assertEqual(desktop_result["desktop_provider"], "novnc")
             self.assertTrue(desktop_result["path"].startswith("/desktop/"))
             self.assertEqual(export_result["credentials"][0]["account_dir"], "wxid_healthy")
