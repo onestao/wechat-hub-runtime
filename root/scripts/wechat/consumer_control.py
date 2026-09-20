@@ -225,7 +225,14 @@ class ConsumerControl:
         spec = CONSUMERS[consumer]
         image = _env_image(spec)
         configured, configuration_detail = self._configuration(consumer)
-        inspected = self._find(consumer) if self.engine.available else None
+        name = str(spec["container_name"])
+        raw_inspected = self.engine.inspect_container(name) if self.engine.available else None
+        is_foreign = False
+        if raw_inspected is not None:
+            labels = (raw_inspected.get("Config") or {}).get("Labels") or {}
+            if str(labels.get(CONSUMER_LABEL) or "") != consumer:
+                is_foreign = True
+        inspected = None if is_foreign else raw_inspected
         running = bool(inspected and (inspected.get("State") or {}).get("Running"))
         state_obj = (inspected or {}).get("State") or {}
         exit_code = state_obj.get("ExitCode")
@@ -240,8 +247,10 @@ class ConsumerControl:
         current_image = str(((inspected or {}).get("Config") or {}).get("Image") or "")
         provisioned = inspected is not None
         image_present = provisioned or self._image_present(image)
-        can_start = bool(configured and image_present)
-        if not configured:
+        can_start = bool(not is_foreign and configured and image_present)
+        if is_foreign:
+            blocked_reason = f"容器名 {name} 已被非受管容器占用，拒绝启动"
+        elif not configured:
             blocked_reason = configuration_detail
         elif not image_present:
             blocked_reason = f"本机没有 {image}，请先拉取镜像"
@@ -259,6 +268,7 @@ class ConsumerControl:
             "provisioned": provisioned,
             "configured": configured,
             "configuration_detail": configuration_detail,
+            "is_foreign": is_foreign,
             "state": state,
             "running": running,
             "started_at": str(state_obj.get("StartedAt") or ""),
@@ -294,7 +304,7 @@ class ConsumerControl:
             time.sleep(STOP_CONFIRM_INTERVAL_SEC)
         return False
 
-    def stop(self, consumer: str) -> dict[str, Any]:
+    def stop(self, consumer: str, *, preserve_desired_mode: bool = False) -> dict[str, Any]:
         if consumer not in CONSUMERS:
             raise ConsumerControlError(f"unknown consumer: {consumer}", code="invalid_request")
         with _STATE_LOCK:
@@ -310,7 +320,8 @@ class ConsumerControl:
                 )
             # Stopping is an intent: the Runtime must not restart this consumer
             # on the next mode reconciliation.
-            self._write_desired_mode(MODE_DISABLED, detail=f"{consumer} stopped")
+            if not preserve_desired_mode:
+                self._write_desired_mode(MODE_DISABLED, detail=f"{consumer} stopped")
             return {"consumer": consumer, "stopped": True}
 
     def _create(self, consumer: str) -> dict[str, Any]:
@@ -365,6 +376,11 @@ class ConsumerControl:
             raise ConsumerControlError(f"unknown consumer: {consumer}")
         with _STATE_LOCK:
             status = self._status(consumer)
+            if status.get("is_foreign"):
+                raise ConsumerControlError(
+                    f"容器名 {status['container_name']} 已被非受管容器占用，拒绝操作",
+                    code="consumer_foreign_conflict",
+                )
             if not status["configured"]:
                 # Fail closed with an actionable message instead of a crash loop.
                 raise ConsumerControlError(
@@ -415,3 +431,47 @@ class ConsumerControl:
             self._write_desired_mode(mode)
             after["desired_mode"] = mode
             return after
+
+    def reconcile_desired_mode(self) -> dict[str, Any]:
+        """One-shot startup reconciliation against the persisted desired_mode.
+
+        Executed once upon Runtime initialization.
+        Reuses existing stop/start primitives.
+        Guarantees:
+        - EFB XOR Agent mutual exclusion.
+        - Fails closed without retry loop.
+        - Never crashes the Runtime.
+        - Preserves desired_mode on failure.
+        """
+        with _STATE_LOCK:
+            target_mode = self.desired_mode()
+            try:
+                if target_mode == MODE_DISABLED:
+                    for consumer in (CONSUMER_EFB, CONSUMER_AGENT):
+                        inspected = self._find(consumer)
+                        if inspected is not None and bool((inspected.get("State") or {}).get("Running")):
+                            self.stop(consumer)
+                elif target_mode == CONSUMER_AGENT:
+                    inspected_efb = self._find(CONSUMER_EFB)
+                    if inspected_efb is not None and bool((inspected_efb.get("State") or {}).get("Running")):
+                        self.stop(CONSUMER_EFB, preserve_desired_mode=True)
+                    inspected_agent = self._find(CONSUMER_AGENT)
+                    if not (inspected_agent and bool((inspected_agent.get("State") or {}).get("Running"))):
+                        self.start(CONSUMER_AGENT)
+                elif target_mode == CONSUMER_EFB:
+                    inspected_agent = self._find(CONSUMER_AGENT)
+                    if inspected_agent and bool((inspected_agent.get("State") or {}).get("Running")):
+                        self.stop(CONSUMER_AGENT, preserve_desired_mode=True)
+                    inspected_efb = self._find(CONSUMER_EFB)
+                    if not (inspected_efb and bool((inspected_efb.get("State") or {}).get("Running"))):
+                        self.start(CONSUMER_EFB)
+            except Exception as exc:
+                logger.warning(
+                    "Startup reconciliation for desired consumer mode %r did not complete: %s",
+                    target_mode,
+                    exc,
+                )
+            finally:
+                if self.desired_mode() != target_mode:
+                    self._write_desired_mode(target_mode, detail="retained after startup reconciliation")
+            return self.snapshot()

@@ -346,6 +346,26 @@ class LoginConvergenceTests(unittest.TestCase):
             ),
             "WECHAT_LOGGED_IN",
         )
+        self.assertEqual(
+            normalize(
+                flow_state="logged_in",
+                auth_status="logged_in",
+                logged_in_user="wxid_x",
+                container_running=True,
+                profile_hydration="pending",
+            ),
+            "IDENTITY_HYDRATING",
+        )
+        self.assertEqual(
+            normalize(
+                flow_state="logged_in",
+                auth_status="logged_in",
+                logged_in_user="wxid_x",
+                container_running=True,
+                profile_hydration="complete",
+            ),
+            "READY",
+        )
 
 
 class RegisterIdempotencyTests(unittest.TestCase):

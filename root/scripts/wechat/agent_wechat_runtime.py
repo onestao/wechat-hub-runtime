@@ -70,6 +70,7 @@ LOGIN_STATE_CREATING = "CREATING"
 LOGIN_STATE_QR_READY = "QR_READY"
 LOGIN_STATE_QR_SCANNED = "QR_SCANNED"
 LOGIN_STATE_PHONE_CONFIRM_PENDING = "PHONE_CONFIRM_PENDING"
+LOGIN_STATE_LOGGED_IN = "LOGGED_IN"
 LOGIN_STATE_WECHAT_LOGGED_IN = "WECHAT_LOGGED_IN"
 LOGIN_STATE_IDENTITY_HYDRATING = "IDENTITY_HYDRATING"
 LOGIN_STATE_READY = "READY"
@@ -82,8 +83,11 @@ def normalize_login_state(
     auth_status: str,
     logged_in_user: str,
     container_running: bool,
+    profile_hydration: str = "",
 ) -> str:
     """Project the runtime's internal flow state onto the product login FSM.
+
+    CREATING -> QR_READY -> PHONE_CONFIRM_PENDING -> LOGGED_IN -> IDENTITY_HYDRATING -> READY
 
     The authoritative observation wins over the socket: a real logged-in
     account is never reported as FAILED just because a login socket timed out.
@@ -91,8 +95,15 @@ def normalize_login_state(
 
     flow_state = str(flow_state or "")
     auth_status = str(auth_status or "")
-    if auth_status == "logged_in" and logged_in_user:
+    profile_hydration = str(profile_hydration or "")
+
+    if (auth_status == "logged_in" and logged_in_user) or flow_state == "logged_in":
+        if profile_hydration == "pending":
+            return LOGIN_STATE_IDENTITY_HYDRATING
+        if profile_hydration in {"complete", "unavailable"}:
+            return LOGIN_STATE_READY
         return LOGIN_STATE_WECHAT_LOGGED_IN
+
     if not container_running:
         return LOGIN_STATE_CREATING
     if flow_state in {"timeout", "error"}:
@@ -103,8 +114,6 @@ def normalize_login_state(
         return LOGIN_STATE_QR_READY
     if flow_state in {"authenticating", "starting", ""}:
         return LOGIN_STATE_CREATING
-    if flow_state == "logged_in":
-        return LOGIN_STATE_WECHAT_LOGGED_IN
     return LOGIN_STATE_CREATING
 
 # Self identity hydration is cached so a status poll never turns into an
@@ -2366,6 +2375,7 @@ class AgentWechatManager:
                 auth_status=auth_status,
                 logged_in_user=logged_in_user,
                 container_running=container_running,
+                profile_hydration=str((profile or {}).get("profile_hydration") or ""),
             ),
         }
 

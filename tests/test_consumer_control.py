@@ -450,6 +450,120 @@ class ConsumerControlTests(unittest.TestCase):
         )
         self.assertEqual(payload["HostConfig"]["NetworkMode"], "wechat-hub-internal")
 
+    # -- startup reconciliation (Task A) -----------------------------------
+
+    def test_reconcile_disabled_with_nothing_running(self):
+        engine = FakeEngine(images=(AGENT_IMAGE,))
+        control, patchers = self.make_control(engine, self.profile_root)
+        with patchers[0], patchers[1]:
+            control._write_desired_mode(consumer_control.MODE_DISABLED)
+            snapshot = control.reconcile_desired_mode()
+            self.assertEqual(snapshot["mode"], consumer_control.MODE_DISABLED)
+            self.assertEqual(snapshot["desired_mode"], consumer_control.MODE_DISABLED)
+            self.assertEqual(engine.running(), [])
+
+    def test_reconcile_agent_desired_when_agent_absent(self):
+        engine = FakeEngine(images=(AGENT_IMAGE,))
+        control, patchers = self.make_control(engine, self.profile_root)
+        with patchers[0], patchers[1]:
+            control._write_desired_mode(consumer_control.MODE_AGENT)
+            snapshot = control.reconcile_desired_mode()
+            self.assertEqual(snapshot["mode"], consumer_control.MODE_AGENT)
+            self.assertEqual(snapshot["desired_mode"], consumer_control.MODE_AGENT)
+            self.assertEqual(engine.running(), [consumer_control.CONSUMER_AGENT])
+
+    def test_reconcile_agent_desired_when_efb_running(self):
+        engine = FakeEngine(images=(AGENT_IMAGE, EFB_IMAGE))
+        engine.add(consumer_control.CONSUMER_EFB, running=True)
+        control, patchers = self.make_control(engine, self.profile_root)
+        with patchers[0], patchers[1]:
+            control._write_desired_mode(consumer_control.MODE_AGENT)
+            snapshot = control.reconcile_desired_mode()
+            # EFB XOR Agent enforced
+            self.assertEqual(snapshot["mode"], consumer_control.MODE_AGENT)
+            self.assertEqual(snapshot["desired_mode"], consumer_control.MODE_AGENT)
+            self.assertEqual(engine.running(), [consumer_control.CONSUMER_AGENT])
+
+    def test_reconcile_agent_desired_when_agent_already_running(self):
+        engine = FakeEngine(images=(AGENT_IMAGE,))
+        engine.add(consumer_control.CONSUMER_AGENT, running=True)
+        control, patchers = self.make_control(engine, self.profile_root)
+        with patchers[0], patchers[1]:
+            control._write_desired_mode(consumer_control.MODE_AGENT)
+            ops_before = list(engine.operations)
+            snapshot = control.reconcile_desired_mode()
+            self.assertEqual(snapshot["mode"], consumer_control.MODE_AGENT)
+            self.assertEqual(snapshot["desired_mode"], consumer_control.MODE_AGENT)
+            self.assertEqual(engine.running(), [consumer_control.CONSUMER_AGENT])
+            # no-op: no extra container start/stop/create
+            self.assertEqual(engine.operations, ops_before)
+
+    def test_reconcile_efb_desired_when_agent_running(self):
+        self._configure_efb(token=True)
+        engine = FakeEngine(images=(AGENT_IMAGE, EFB_IMAGE))
+        engine.add(consumer_control.CONSUMER_AGENT, running=True)
+        control, patchers = self.make_control(engine, self.profile_root)
+        with patchers[0], patchers[1]:
+            control._write_desired_mode(consumer_control.MODE_EFB)
+            snapshot = control.reconcile_desired_mode()
+            self.assertEqual(snapshot["mode"], consumer_control.MODE_EFB)
+            self.assertEqual(snapshot["desired_mode"], consumer_control.MODE_EFB)
+            self.assertEqual(engine.running(), [consumer_control.CONSUMER_EFB])
+
+    def test_reconcile_efb_desired_when_efb_unconfigured(self):
+        # EFB is unconfigured
+        engine = FakeEngine(images=(AGENT_IMAGE, EFB_IMAGE))
+        engine.add(consumer_control.CONSUMER_AGENT, running=True)
+        control, patchers = self.make_control(engine, self.profile_root)
+        with patchers[0], patchers[1]:
+            control._write_desired_mode(consumer_control.MODE_EFB)
+            snapshot = control.reconcile_desired_mode()
+            # Does not crash Runtime, stops outgoing agent, leaves EFB not running
+            self.assertEqual(snapshot["mode"], consumer_control.MODE_DISABLED)
+            # Preserves desired_mode!
+            self.assertEqual(snapshot["desired_mode"], consumer_control.MODE_EFB)
+            self.assertEqual(engine.running(), [])
+            efb_status = snapshot["consumers"]["efb"]
+            self.assertFalse(efb_status["configured"])
+            self.assertIn("尚未配置", efb_status["blocked_reason"])
+
+    def test_reconcile_restart_idempotency(self):
+        engine = FakeEngine(images=(AGENT_IMAGE,))
+        control, patchers = self.make_control(engine, self.profile_root)
+        with patchers[0], patchers[1]:
+            control._write_desired_mode(consumer_control.MODE_AGENT)
+            s1 = control.reconcile_desired_mode()
+            self.assertEqual(s1["mode"], consumer_control.MODE_AGENT)
+            ops_after_first = list(engine.operations)
+            s2 = control.reconcile_desired_mode()
+            self.assertEqual(s2["mode"], consumer_control.MODE_AGENT)
+            self.assertEqual(engine.operations, ops_after_first)
+
+    def test_reconcile_foreign_same_name_container_protection(self):
+        engine = FakeEngine(images=(AGENT_IMAGE,))
+        engine.containers["wechat-hub-agent"] = {
+            "Id": "id-foreign",
+            "Config": {"Image": AGENT_IMAGE, "Labels": {}},
+            "State": {"Running": True, "ExitCode": 0, "StartedAt": "", "FinishedAt": "", "Error": ""},
+            "RestartCount": 0,
+            "Mounts": [],
+            "NetworkSettings": {"Networks": {}},
+        }
+        control, patchers = self.make_control(engine, self.profile_root)
+        with patchers[0], patchers[1]:
+            # Case 1: desired = disabled. Foreign container must NOT be stopped.
+            control._write_desired_mode(consumer_control.MODE_DISABLED)
+            snapshot = control.reconcile_desired_mode()
+            self.assertEqual(snapshot["mode"], consumer_control.MODE_DISABLED)
+            self.assertEqual(engine.operations, [])
+            self.assertTrue(engine.containers["wechat-hub-agent"]["State"]["Running"])
+
+            # Case 2: desired = agent. Foreign container must NOT be adopted/started/stopped.
+            control._write_desired_mode(consumer_control.MODE_AGENT)
+            snapshot2 = control.reconcile_desired_mode()
+            self.assertEqual(snapshot2["desired_mode"], consumer_control.MODE_AGENT)
+            self.assertEqual(engine.operations, [])
+
 
 if __name__ == "__main__":
     unittest.main()

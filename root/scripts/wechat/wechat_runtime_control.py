@@ -438,6 +438,14 @@ def main(argv: list[str] | None = None) -> int:
     registry.load(create=False)
     server = create_server(args.socket, registry)
     try:
+        from consumer_control import ConsumerControl
+
+        ConsumerControl().reconcile_desired_mode()
+    except Exception as exc:
+        logging.getLogger("wechat_runtime_control").warning(
+            "Startup reconciliation of desired consumer mode encountered an error: %s", exc
+        )
+    try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
