@@ -136,8 +136,11 @@ class ConsumerControl:
 
     # -- paths -------------------------------------------------------------
 
-    @staticmethod
-    def _host_config_root() -> str:
+    def _host_config_root(self) -> str:
+        """Host path behind this container's /config mount.
+
+        Not a staticmethod: it needs the engine to inspect the Runtime itself.
+        """
         inspected = self._self_inspect()
         for mount in inspected.get("Mounts") or []:
             if isinstance(mount, dict) and mount.get("Destination") == "/config":

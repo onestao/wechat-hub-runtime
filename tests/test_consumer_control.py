@@ -11,6 +11,7 @@ through the Runtime control plane.  These tests pin the safety properties:
 """
 
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
@@ -54,6 +55,19 @@ class FakeEngine:
         return True
 
     def inspect_container(self, identifier):
+        # The Runtime inspects *itself* to find the host path behind /config.
+        if identifier and identifier == os.environ.get("HOSTNAME", ""):
+            return {
+                "Id": "id-self",
+                "Config": {"Image": "runtime", "Labels": {}},
+                "State": {"Running": True, "ExitCode": 0, "StartedAt": "", "FinishedAt": "", "Error": ""},
+                "RestartCount": 0,
+                "Mounts": [
+                    {"Source": "/mnt/user/appdata/wechat-hub/runtime-config", "Destination": "/config"},
+                    {"Source": "/var/run/docker.sock", "Destination": "/var/run/docker.sock"},
+                ],
+                "NetworkSettings": {"Networks": {"wechat-hub-internal": {}}},
+            }
         return self.containers.get(identifier)
 
     def request(self, method, path, payload=None, **kwargs):
@@ -390,6 +404,30 @@ class ConsumerControlTests(unittest.TestCase):
             clear=False,
         ):
             self.assertEqual(control._network(), "wechat-hub-internal")
+
+    # -- the real host-config-root path -------------------------------------
+    #
+    # These do NOT stub _host_config_root: that is how the staticmethod bug
+    # (NameError: name 'self' is not defined) survived every earlier test.
+
+    def test_host_config_root_is_read_through_the_engine(self):
+        engine = FakeEngine(images=(AGENT_IMAGE,))
+        control = consumer_control.ConsumerControl(engine=engine)
+        with patch.dict("os.environ", {"HOSTNAME": "runtime-self"}, clear=False):
+            self.assertEqual(control._host_config_root(), "/mnt/user/appdata/wechat-hub/runtime-config")
+
+    def test_agent_start_binds_the_real_host_config_root(self):
+        engine = FakeEngine(images=(AGENT_IMAGE,))
+        control = consumer_control.ConsumerControl(engine=engine)
+        with patch.dict("os.environ", {"HOSTNAME": "runtime-self"}, clear=False):
+            control.start(consumer_control.CONSUMER_AGENT)
+
+        payload = engine.created["wechat-hub-agent"]
+        self.assertIn(
+            "/mnt/user/appdata/wechat-hub/runtime-config/agent-data:/data",
+            payload["HostConfig"]["Binds"],
+        )
+        self.assertEqual(payload["HostConfig"]["NetworkMode"], "wechat-hub-internal")
 
 
 if __name__ == "__main__":
