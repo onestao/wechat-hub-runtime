@@ -412,15 +412,19 @@ class ConsumerControl:
         if mode not in MODES:
             raise ConsumerControlError(f"unsupported mode: {mode!r}", code="invalid_request")
         with _STATE_LOCK:
+            self._write_desired_mode(mode)
             snapshot = self.snapshot()
             running = [c for c, s in snapshot["consumers"].items() if s["running"]]
             # Mutual exclusion: stop everything that is not the requested mode
             # and *confirm* it stopped before starting the requested one.
             for consumer in running:
                 if consumer != mode:
-                    self.stop(consumer)
-            if mode != MODE_DISABLED:
-                self.start(mode)
+                    self.stop(consumer, preserve_desired_mode=True)
+            try:
+                if mode != MODE_DISABLED:
+                    self.start(mode)
+            finally:
+                self._write_desired_mode(mode)
             after = self.snapshot()
             still_running = [c for c, s in after["consumers"].items() if s["running"]]
             if len(still_running) > 1 or (mode == MODE_DISABLED and still_running):
@@ -428,7 +432,6 @@ class ConsumerControl:
                     f"互斥校验失败：同时处于 RUNNING 的消费者为 {sorted(still_running)}",
                     code="consumer_mutual_exclusion_violation",
                 )
-            self._write_desired_mode(mode)
             after["desired_mode"] = mode
             return after
 
