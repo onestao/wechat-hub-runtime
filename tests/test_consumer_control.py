@@ -416,6 +416,27 @@ class ConsumerControlTests(unittest.TestCase):
         with patch.dict("os.environ", {"HOSTNAME": "runtime-self"}, clear=False):
             self.assertEqual(control._host_config_root(), "/mnt/user/appdata/wechat-hub/runtime-config")
 
+    def test_start_and_stop_persist_the_desired_mode(self):
+        """A Runtime restart must not resurrect a stopped consumer, nor forget a started one."""
+
+        engine = FakeEngine(images=(AGENT_IMAGE,))
+        control, patchers = self.make_control(engine, self.profile_root)
+        with patchers[0], patchers[1]:
+            self.assertEqual(control.desired_mode(), consumer_control.MODE_DISABLED)
+            control.start(consumer_control.CONSUMER_AGENT)
+            self.assertEqual(control.desired_mode(), consumer_control.MODE_AGENT)
+            control.stop(consumer_control.CONSUMER_AGENT)
+            self.assertEqual(control.desired_mode(), consumer_control.MODE_DISABLED)
+
+    def test_set_mode_persists_the_desired_mode(self):
+        engine = FakeEngine(images=(AGENT_IMAGE,))
+        control, patchers = self.make_control(engine, self.profile_root)
+        with patchers[0], patchers[1]:
+            control.set_mode(consumer_control.MODE_AGENT)
+            self.assertEqual(control.desired_mode(), consumer_control.MODE_AGENT)
+            control.set_mode(consumer_control.MODE_DISABLED)
+            self.assertEqual(control.desired_mode(), consumer_control.MODE_DISABLED)
+
     def test_agent_start_binds_the_real_host_config_root(self):
         engine = FakeEngine(images=(AGENT_IMAGE,))
         control = consumer_control.ConsumerControl(engine=engine)

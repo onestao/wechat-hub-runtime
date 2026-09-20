@@ -308,6 +308,9 @@ class ConsumerControl:
                     f"{consumer} 未能在限定时间内停止；已中止切换以保证互斥",
                     code="consumer_stop_timeout",
                 )
+            # Stopping is an intent: the Runtime must not restart this consumer
+            # on the next mode reconciliation.
+            self._write_desired_mode(MODE_DISABLED, detail=f"{consumer} stopped")
             return {"consumer": consumer, "stopped": True}
 
     def _create(self, consumer: str) -> dict[str, Any]:
@@ -384,6 +387,8 @@ class ConsumerControl:
                 )
             if not self._confirm_running(consumer):
                 raise ConsumerControlError(f"{consumer} 启动后未进入 RUNNING 状态", code="consumer_start_failed")
+            # Starting is an intent: survive a Runtime restart.
+            self._write_desired_mode(consumer, detail=f"{consumer} started")
             return {"consumer": consumer, "started": True}
 
     def set_mode(self, mode: str) -> dict[str, Any]:
