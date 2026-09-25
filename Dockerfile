@@ -1,6 +1,9 @@
 # WeChat for Linux using Selkies baseimage
 FROM ghcr.io/linuxserver/baseimage-selkies:ubuntunoble
 
+ARG OCI_REVISION
+ARG OCI_VERSION
+
 # Metadata labels
 LABEL org.opencontainers.image.title="WeChat Selkies"
 LABEL org.opencontainers.image.description="WeChat Linux client in browser via Selkies WebRTC"
@@ -11,9 +14,6 @@ LABEL org.opencontainers.image.version="${OCI_VERSION}"
 LABEL org.opencontainers.image.documentation="https://github.com/nickrunning/wechat-selkies#readme"
 LABEL org.opencontainers.image.vendor="WeChat Selkies Project"
 LABEL org.opencontainers.image.licenses="GPL-3.0-only"
-
-ARG OCI_REVISION
-ARG OCI_VERSION
 
 # Build arguments for multi-arch support
 ARG TARGETPLATFORM
